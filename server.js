@@ -9,9 +9,15 @@ const nodemailer = require('nodemailer');
 const bcrypt = require('bcrypt'); 
 const helmet = require('helmet'); 
 const rateLimit = require('express-rate-limit'); 
+const fs = require('fs');
+
+// --- ΔΗΜΙΟΥΡΓΙΑ ΦΑΚΕΛΟΥ UPLOADS ΑΝ ΔΕΝ ΥΠΑΡΧΕΙ ---
+if (!fs.existsSync('uploads')) {
+    fs.mkdirSync('uploads');
+}
 
 const app = express();
-const PORT = 5000;
+const PORT = process.env.PORT || 5000;
 
 // --- 🛡️ SECURITY LAYER 1: HTTP HEADERS ---
 app.use(helmet());
@@ -71,7 +77,6 @@ const userSchema = new mongoose.Schema({
 });
 const User = mongoose.model('User', userSchema);
 
-// 🟢 ΑΛΛΑΓΗ ΕΔΩ: Προστέθηκε το πεδίο `price: String` στο Vote Event
 const voteEventSchema = new mongoose.Schema({ 
     title: String, 
     image: String, 
@@ -79,7 +84,7 @@ const voteEventSchema = new mongoose.Schema({
     currentVotes: { type: Number, default: 0 }, 
     startDate: Date, 
     durationDays: Number,
-    price: String // <-- Αυτό έλειπε!
+    price: String
 });
 const VoteEvent = mongoose.model('VoteEvent', voteEventSchema);
 
@@ -175,6 +180,8 @@ app.get('/api/drops', async (req, res) => { const all = await PC.find(); res.jso
 app.post('/api/drops', auth, async (req, res) => { const n = new PC(req.body); await n.save(); res.json(n); });
 app.put('/api/drops/:id', auth, async (req, res) => { const u = await PC.findByIdAndUpdate(req.params.id, req.body, {new:true}); res.json(u); });
 app.delete('/api/drops/:id', auth, async (req, res) => { await PC.findByIdAndDelete(req.params.id); res.json({msg:"Deleted"}); });
+
+// ΔΥΝΑΜΙΚΟ URL ΓΙΑ ΤΙΣ ΦΩΤΟΓΡΑΦΙΕΣ (Render/Localhost)
 app.post('/api/upload', auth, upload.array('photos', 5), (req, res) => { 
     const u = req.files.map(f => `${req.protocol}://${req.get('host')}/uploads/${f.filename}`); 
     res.json({imageUrls: u}); 
