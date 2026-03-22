@@ -175,7 +175,10 @@ app.get('/api/drops', async (req, res) => { const all = await PC.find(); res.jso
 app.post('/api/drops', auth, async (req, res) => { const n = new PC(req.body); await n.save(); res.json(n); });
 app.put('/api/drops/:id', auth, async (req, res) => { const u = await PC.findByIdAndUpdate(req.params.id, req.body, {new:true}); res.json(u); });
 app.delete('/api/drops/:id', auth, async (req, res) => { await PC.findByIdAndDelete(req.params.id); res.json({msg:"Deleted"}); });
-app.post('/api/upload', auth, upload.array('photos', 5), (req, res) => { const u = req.files.map(f => `http://localhost:${PORT}/uploads/${f.filename}`); res.json({imageUrls: u}); });
+app.post('/api/upload', auth, upload.array('photos', 5), (req, res) => { 
+    const u = req.files.map(f => `${req.protocol}://${req.get('host')}/uploads/${f.filename}`); 
+    res.json({imageUrls: u}); 
+});
 
 app.get('/api/vote-event', async (req, res) => { const event = await VoteEvent.findOne(); res.json(event || {}); });
 app.post('/api/vote-event', auth, async (req, res) => { await VoteEvent.deleteMany({}); const n = new VoteEvent(req.body); await n.save(); res.json(n); });
