@@ -2,19 +2,12 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const mongoose = require('mongoose');
-const multer = require('multer');
 const path = require('path');
 const crypto = require('crypto');
 const nodemailer = require('nodemailer');
 const bcrypt = require('bcrypt'); 
 const helmet = require('helmet'); 
 const rateLimit = require('express-rate-limit'); 
-const fs = require('fs');
-
-// --- ΔΗΜΙΟΥΡΓΙΑ ΦΑΚΕΛΟΥ UPLOADS ΑΝ ΔΕΝ ΥΠΑΡΧΕΙ ---
-if (!fs.existsSync('uploads')) {
-    fs.mkdirSync('uploads');
-}
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -31,7 +24,6 @@ const corsOptions = {
 };
 app.use(cors(corsOptions));
 app.use(express.json());
-app.use('/uploads', express.static('uploads'));
 
 // --- 🛡️ SECURITY LAYER 3: RATE LIMITING ---
 const apiLimiter = rateLimit({
@@ -107,9 +99,6 @@ const transporter = nodemailer.createTransport({
     }
 });
 
-const storage = multer.diskStorage({ destination: (req, file, cb) => cb(null, 'uploads/'), filename: (req, file, cb) => cb(null, Date.now() + path.extname(file.originalname)) });
-const upload = multer({ storage: storage });
-
 const auth = (req, res, next) => { 
     if (req.headers['x-admin-auth'] === ADMIN_PASSWORD) next(); 
     else res.status(403).json({ error: "⛔ SECURE BREACH DETECTED: WRONG ADMIN PASSWORD" }); 
@@ -180,12 +169,6 @@ app.get('/api/drops', async (req, res) => { const all = await PC.find(); res.jso
 app.post('/api/drops', auth, async (req, res) => { const n = new PC(req.body); await n.save(); res.json(n); });
 app.put('/api/drops/:id', auth, async (req, res) => { const u = await PC.findByIdAndUpdate(req.params.id, req.body, {new:true}); res.json(u); });
 app.delete('/api/drops/:id', auth, async (req, res) => { await PC.findByIdAndDelete(req.params.id); res.json({msg:"Deleted"}); });
-
-// ΔΥΝΑΜΙΚΟ URL ΓΙΑ ΤΙΣ ΦΩΤΟΓΡΑΦΙΕΣ (Render/Localhost)
-app.post('/api/upload', auth, upload.array('photos', 5), (req, res) => { 
-    const u = req.files.map(f => `${req.protocol}://${req.get('host')}/uploads/${f.filename}`); 
-    res.json({imageUrls: u}); 
-});
 
 app.get('/api/vote-event', async (req, res) => { const event = await VoteEvent.findOne(); res.json(event || {}); });
 app.post('/api/vote-event', auth, async (req, res) => { await VoteEvent.deleteMany({}); const n = new VoteEvent(req.body); await n.save(); res.json(n); });
