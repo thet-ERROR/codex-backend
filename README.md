@@ -1,4 +1,4 @@
-# Phoenix Codex - Backend API 🚀
+# Phoenix Codex - Backend API 🚀 DEMO
 
 This is the core REST API for the **Phoenix Codex** e-commerce platform. It handles data persistence, administrative functions, and secure communication between the frontend and the database.
 
