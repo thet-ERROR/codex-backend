@@ -39,6 +39,15 @@ const authLimiter = rateLimit({
     message: { error: "⛔ ACCESS DENIED: Max authentication attempts reached." }
 });
 
+// --- 🛡️ SECURITY LAYER 4: PREVENT API CACHING (GHOST CACHE FIX) ---
+app.use('/api', (req, res, next) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+    res.setHeader('Surrogate-Control', 'no-store');
+    next();
+});
+
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD; 
 const dbURI = process.env.DB_URI;
 
