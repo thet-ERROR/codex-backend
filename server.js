@@ -58,11 +58,11 @@ mongoose.connect(dbURI, { serverSelectionTimeoutMS: 30000, socketTimeoutMS: 4500
 
 // --- SCHEMAS ---
 const pcSchema = new mongoose.Schema({
-    name: String, price: String, description: String, stock: { type: Number, default: 1 }, 
+    name: String, price: String, description: String, lore: String, stock: { type: Number, default: 1 }, 
     images: [String], status: { type: String, default: 'available' }, category: { type: String, default: 'drop' },    
     multitasking: { type: Number, default: 0 },
     specs: { cpu: String, gpu: String, ram: String, ssd: String, mobo: String, psu: String, case: String },
-    specDetails: { type: Map, of: String, default: {} }, // <--- ΝΕΑ ΓΡΑΜΜΗ: Εδώ θα σώζονται οι περιγραφές!
+    specDetails: { type: Map, of: String, default: {} }, 
     fps: [{ game: String, score: Number }],
     reviews: [{ user: String, text: String, rating: Number, date: { type: Date, default: Date.now } }],
     votes: { type: Number, default: 0 }
