@@ -72,8 +72,9 @@ const PC = mongoose.model('PC', pcSchema);
 const userSchema = new mongoose.Schema({
     username: { type: String, required: true, unique: true },
     email: { type: String, required: true, unique: true },
-    password: { type: String, required: true }, 
+    password: { type: String, required: true },
     joined: { type: Date, default: Date.now },
+    subscribed: { type: Boolean, default: false },
     resetToken: String,
     resetTokenExpiry: Date
 });
@@ -101,28 +102,72 @@ const ReviewTicket = mongoose.model('ReviewTicket', reviewTicketSchema);
 const newsletterSchema = new mongoose.Schema({ email: String, date: { type: Date, default: Date.now } });
 const Newsletter = mongoose.model('Newsletter', newsletterSchema);
 
+const siteConfigSchema = new mongoose.Schema({
+    maintenanceMode: { type: Boolean, default: false },
+    maintenanceMessage: { type: String, default: "PHOENIX CODEX is currently undergoing scheduled maintenance. We'll be back online shortly." }
+});
+const SiteConfig = mongoose.model('SiteConfig', siteConfigSchema);
+
 const transporter = nodemailer.createTransport({
     service: 'gmail',
     auth: {
-        user: process.env.EMAIL_USER, 
-        pass: process.env.EMAIL_PASS  
+        user: process.env.EMAIL_USER,
+        pass: process.env.EMAIL_PASS
     }
 });
 
-const auth = (req, res, next) => { 
-    if (req.headers['x-admin-auth'] === ADMIN_PASSWORD) next(); 
-    else res.status(403).json({ error: "⛔ SECURE BREACH DETECTED: WRONG ADMIN PASSWORD" }); 
+const auth = (req, res, next) => {
+    if (req.headers['x-admin-auth'] === ADMIN_PASSWORD) next();
+    else res.status(403).json({ error: "⛔ SECURE BREACH DETECTED: WRONG ADMIN PASSWORD" });
 };
 
+// --- 🛡️ SECURITY LAYER 5: MAINTENANCE KILL SWITCH ---
+app.use('/api', async (req, res, next) => {
+    if (req.path === '/status' || req.path === '/login' || req.headers['x-admin-auth'] === ADMIN_PASSWORD) return next();
+    try {
+        const config = await SiteConfig.findOne();
+        if (config?.maintenanceMode) {
+            return res.status(503).json({ maintenance: true, message: config.maintenanceMessage });
+        }
+    } catch (e) {
+        console.error("Maintenance check failed, failing open:", e);
+    }
+    next();
+});
+
 // --- ROUTES ---
+app.get('/api/status', async (req, res) => {
+    const config = await SiteConfig.findOne();
+    res.json({ maintenance: !!config?.maintenanceMode, message: config?.maintenanceMessage || null });
+});
+
+app.get('/api/site-config', auth, async (req, res) => {
+    let config = await SiteConfig.findOne();
+    if (!config) config = await new SiteConfig().save();
+    res.json(config);
+});
+
+app.post('/api/site-config', auth, async (req, res) => {
+    const { maintenanceMode, maintenanceMessage } = req.body;
+    let config = await SiteConfig.findOne();
+    if (!config) config = new SiteConfig();
+    if (typeof maintenanceMode === 'boolean') config.maintenanceMode = maintenanceMode;
+    if (typeof maintenanceMessage === 'string') config.maintenanceMessage = maintenanceMessage;
+    await config.save();
+    res.json({ success: true, config });
+});
+
 app.post('/api/register', authLimiter, async (req, res) => {
     try {
-        const { username, email, password } = req.body;
+        const { username, email, password, subscribed } = req.body;
         if (await User.findOne({ email })) return res.status(400).json({ error: "Email exists" });
         const salt = await bcrypt.genSalt(10);
         const hashedPassword = await bcrypt.hash(password, salt);
-        const newUser = new User({ username, email, password: hashedPassword }); 
+        const newUser = new User({ username, email, password: hashedPassword, subscribed: !!subscribed });
         await newUser.save();
+        if (subscribed) {
+            try { await new Newsletter({ email }).save(); } catch (e) { console.error("Newsletter subscribe failed:", e); }
+        }
         res.json({ success: true, username: newUser.username });
     } catch (e) { res.status(500).json({ error: "Error" }); }
 });
