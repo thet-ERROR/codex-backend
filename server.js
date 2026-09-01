@@ -13,6 +13,11 @@ const rateLimit = require('express-rate-limit');
 const app = express();
 const PORT = process.env.PORT || 5000;
 
+// Render sits in front of this app behind its own reverse proxy — trust the first hop so
+// express-rate-limit (and req.ip generally) reads the real client IP from X-Forwarded-For
+// instead of Render's proxy IP.
+app.set('trust proxy', 1);
+
 // --- 🛡️ SECURITY LAYER 1: HTTP HEADERS ---
 app.use(helmet());
 app.use(helmet.crossOriginResourcePolicy({ policy: "cross-origin" })); 
@@ -64,7 +69,7 @@ mongoose.connect(dbURI, { serverSelectionTimeoutMS: 30000, socketTimeoutMS: 4500
 
 // --- SCHEMAS ---
 const pcSchema = new mongoose.Schema({
-    name: String, price: String, description: String, lore: String, stock: { type: Number, default: 1 }, 
+    name: String, price: String, description: String, lore: String, loreEl: String, stock: { type: Number, default: 1 },
     images: [String], status: { type: String, default: 'available' }, category: { type: String, default: 'drop' },    
     multitasking: { type: Number, default: 0 },
     specs: { cpu: String, gpu: String, ram: String, ssd: String, mobo: String, psu: String, case: String },
