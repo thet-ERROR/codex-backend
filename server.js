@@ -35,8 +35,8 @@ const apiLimiter = rateLimit({
 app.use('/api/', apiLimiter);
 
 const authLimiter = rateLimit({
-    windowMs: 60 * 60 * 1000, 
-    max: 10, 
+    windowMs: 60 * 60 * 1000,
+    max: 50,
     message: { error: "⛔ ACCESS DENIED: Max authentication attempts reached." }
 });
 
@@ -52,6 +52,10 @@ app.use('/api', (req, res, next) => {
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
 const JWT_SECRET = process.env.JWT_SECRET;
 const dbURI = process.env.DB_URI;
+
+if (!JWT_SECRET) {
+    console.error("⚠️ JWT_SECRET is not set in environment variables — every /api/register and /api/user-login call will fail with a 500 until it's added.");
+}
 
 console.log("⏳ Connecting to MongoDB...");
 mongoose.connect(dbURI, { serverSelectionTimeoutMS: 30000, socketTimeoutMS: 45000 })
@@ -187,7 +191,7 @@ app.post('/api/register', authLimiter, async (req, res) => {
         }
         const token = jwt.sign({ id: newUser._id, username: newUser.username }, JWT_SECRET, { expiresIn: '30d' });
         res.json({ success: true, username: newUser.username, token });
-    } catch (e) { res.status(500).json({ error: "Error" }); }
+    } catch (e) { console.error("Register failed:", e); res.status(500).json({ error: "Error" }); }
 });
 
 app.post('/api/user-login', authLimiter, async (req, res) => {
@@ -201,7 +205,7 @@ app.post('/api/user-login', authLimiter, async (req, res) => {
             res.json({ success: true, username: user.username, token });
         }
         else res.status(400).json({ error: "Invalid Credentials" });
-    } catch (e) { res.status(500).json({ error: "Server Error" }); }
+    } catch (e) { console.error("Login failed:", e); res.status(500).json({ error: "Server Error" }); }
 });
 
 app.get('/api/me', authUser, async (req, res) => {
@@ -209,7 +213,7 @@ app.get('/api/me', authUser, async (req, res) => {
         const user = await User.findById(req.userId).populate('wishlist');
         if (!user) return res.status(404).json({ error: "User not found" });
         res.json({ username: user.username, wishlist: user.wishlist, achievements: user.achievements });
-    } catch (e) { res.status(500).json({ error: "Server Error" }); }
+    } catch (e) { console.error("/api/me failed:", e); res.status(500).json({ error: "Server Error" }); }
 });
 
 app.post('/api/wishlist/:pcId', authUser, async (req, res) => {
@@ -222,7 +226,7 @@ app.post('/api/wishlist/:pcId', authUser, async (req, res) => {
         }
         await user.populate('wishlist');
         res.json({ success: true, wishlist: user.wishlist });
-    } catch (e) { res.status(500).json({ error: "Server Error" }); }
+    } catch (e) { console.error("Wishlist add failed:", e); res.status(500).json({ error: "Server Error" }); }
 });
 
 app.delete('/api/wishlist/:pcId', authUser, async (req, res) => {
@@ -233,7 +237,7 @@ app.delete('/api/wishlist/:pcId', authUser, async (req, res) => {
         await user.save();
         await user.populate('wishlist');
         res.json({ success: true, wishlist: user.wishlist });
-    } catch (e) { res.status(500).json({ error: "Server Error" }); }
+    } catch (e) { console.error("Wishlist remove failed:", e); res.status(500).json({ error: "Server Error" }); }
 });
 
 app.post('/api/achievements', authUser, async (req, res) => {
