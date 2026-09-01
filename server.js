@@ -5,8 +5,9 @@ const mongoose = require('mongoose');
 const path = require('path');
 const crypto = require('crypto');
 const nodemailer = require('nodemailer');
-const bcrypt = require('bcrypt'); 
-const helmet = require('helmet'); 
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+const helmet = require('helmet');
 const rateLimit = require('express-rate-limit'); 
 
 const app = express();
@@ -48,7 +49,8 @@ app.use('/api', (req, res, next) => {
     next();
 });
 
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD; 
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
+const JWT_SECRET = process.env.JWT_SECRET;
 const dbURI = process.env.DB_URI;
 
 console.log("⏳ Connecting to MongoDB...");
@@ -76,7 +78,9 @@ const userSchema = new mongoose.Schema({
     joined: { type: Date, default: Date.now },
     subscribed: { type: Boolean, default: false },
     resetToken: String,
-    resetTokenExpiry: Date
+    resetTokenExpiry: Date,
+    wishlist: [{ type: mongoose.Schema.Types.ObjectId, ref: 'PC' }],
+    achievements: { type: [String], default: [] }
 });
 const User = mongoose.model('User', userSchema);
 
@@ -119,6 +123,19 @@ const transporter = nodemailer.createTransport({
 const auth = (req, res, next) => {
     if (req.headers['x-admin-auth'] === ADMIN_PASSWORD) next();
     else res.status(403).json({ error: "⛔ SECURE BREACH DETECTED: WRONG ADMIN PASSWORD" });
+};
+
+const authUser = (req, res, next) => {
+    const header = req.headers['authorization'] || '';
+    const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+    if (!token) return res.status(401).json({ error: "ACCESS DENIED: NO TOKEN PROVIDED" });
+    try {
+        const decoded = jwt.verify(token, JWT_SECRET);
+        req.userId = decoded.id;
+        next();
+    } catch (e) {
+        res.status(401).json({ error: "ACCESS DENIED: INVALID OR EXPIRED TOKEN" });
+    }
 };
 
 // --- 🛡️ SECURITY LAYER 5: MAINTENANCE KILL SWITCH ---
@@ -168,7 +185,8 @@ app.post('/api/register', authLimiter, async (req, res) => {
         if (subscribed) {
             try { await new Newsletter({ email }).save(); } catch (e) { console.error("Newsletter subscribe failed:", e); }
         }
-        res.json({ success: true, username: newUser.username });
+        const token = jwt.sign({ id: newUser._id, username: newUser.username }, JWT_SECRET, { expiresIn: '30d' });
+        res.json({ success: true, username: newUser.username, token });
     } catch (e) { res.status(500).json({ error: "Error" }); }
 });
 
@@ -178,8 +196,56 @@ app.post('/api/user-login', authLimiter, async (req, res) => {
         const user = await User.findOne({ username });
         if (!user) return res.status(400).json({ error: "Invalid Credentials" });
         const isMatch = await bcrypt.compare(password, user.password);
-        if (isMatch) res.json({ success: true, username: user.username }); 
+        if (isMatch) {
+            const token = jwt.sign({ id: user._id, username: user.username }, JWT_SECRET, { expiresIn: '30d' });
+            res.json({ success: true, username: user.username, token });
+        }
         else res.status(400).json({ error: "Invalid Credentials" });
+    } catch (e) { res.status(500).json({ error: "Server Error" }); }
+});
+
+app.get('/api/me', authUser, async (req, res) => {
+    try {
+        const user = await User.findById(req.userId).populate('wishlist');
+        if (!user) return res.status(404).json({ error: "User not found" });
+        res.json({ username: user.username, wishlist: user.wishlist, achievements: user.achievements });
+    } catch (e) { res.status(500).json({ error: "Server Error" }); }
+});
+
+app.post('/api/wishlist/:pcId', authUser, async (req, res) => {
+    try {
+        const user = await User.findById(req.userId);
+        if (!user) return res.status(404).json({ error: "User not found" });
+        if (!user.wishlist.some(id => id.toString() === req.params.pcId)) {
+            user.wishlist.push(req.params.pcId);
+            await user.save();
+        }
+        await user.populate('wishlist');
+        res.json({ success: true, wishlist: user.wishlist });
+    } catch (e) { res.status(500).json({ error: "Server Error" }); }
+});
+
+app.delete('/api/wishlist/:pcId', authUser, async (req, res) => {
+    try {
+        const user = await User.findById(req.userId);
+        if (!user) return res.status(404).json({ error: "User not found" });
+        user.wishlist = user.wishlist.filter(id => id.toString() !== req.params.pcId);
+        await user.save();
+        await user.populate('wishlist');
+        res.json({ success: true, wishlist: user.wishlist });
+    } catch (e) { res.status(500).json({ error: "Server Error" }); }
+});
+
+app.post('/api/achievements', authUser, async (req, res) => {
+    try {
+        const { id } = req.body;
+        const user = await User.findById(req.userId);
+        if (!user) return res.status(404).json({ error: "User not found" });
+        if (id && !user.achievements.includes(id)) {
+            user.achievements.push(id);
+            await user.save();
+        }
+        res.json({ success: true, achievements: user.achievements });
     } catch (e) { res.status(500).json({ error: "Server Error" }); }
 });
 
