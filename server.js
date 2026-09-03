@@ -93,14 +93,15 @@ const userSchema = new mongoose.Schema({
 });
 const User = mongoose.model('User', userSchema);
 
-const voteEventSchema = new mongoose.Schema({ 
-    title: String, 
-    image: String, 
-    targetVotes: Number, 
-    currentVotes: { type: Number, default: 0 }, 
-    startDate: Date, 
+const voteEventSchema = new mongoose.Schema({
+    title: String,
+    image: String,
+    targetVotes: Number,
+    currentVotes: { type: Number, default: 0 },
+    startDate: Date,
     durationDays: Number,
-    price: String
+    price: String,
+    specs: { cpu: String, gpu: String, ram: String, ssd: String, mobo: String, psu: String, case: String }
 });
 const VoteEvent = mongoose.model('VoteEvent', voteEventSchema);
 
@@ -300,9 +301,38 @@ app.post('/api/drops', auth, async (req, res) => { const n = new PC(req.body); a
 app.put('/api/drops/:id', auth, async (req, res) => { const u = await PC.findByIdAndUpdate(req.params.id, req.body, {new:true}); res.json(u); });
 app.delete('/api/drops/:id', auth, async (req, res) => { await PC.findByIdAndDelete(req.params.id); res.json({msg:"Deleted"}); });
 
-app.get('/api/vote-event', async (req, res) => { const event = await VoteEvent.findOne(); res.json(event || {}); });
+app.get('/api/vote-event', async (req, res) => {
+    try {
+        const event = await VoteEvent.findOne();
+        if (event && event.startDate) {
+            const end = new Date(new Date(event.startDate).getTime() + (event.durationDays || 0) * 24 * 60 * 60 * 1000);
+            const expired = new Date() > end;
+            const secured = event.currentVotes >= event.targetVotes;
+            // Un-secured community drops auto-convert to a normal Live Drop once their timer runs out
+            // (checked lazily here, on read, rather than a background timer — this dyno sleeps on
+            // idle on Render's free tier, so a setInterval wouldn't reliably fire anyway).
+            if (expired && !secured) {
+                await new PC({
+                    name: event.title,
+                    price: event.price || '',
+                    images: event.image ? [event.image] : [],
+                    status: 'available',
+                    category: 'drop',
+                    stock: 1,
+                    specs: event.specs || {}
+                }).save();
+                await VoteEvent.deleteMany({});
+                return res.json({});
+            }
+        }
+        res.json(event || {});
+    } catch (e) {
+        console.error("Vote event fetch/expiry check failed:", e);
+        res.json({});
+    }
+});
 app.post('/api/vote-event', auth, async (req, res) => { await VoteEvent.deleteMany({}); const n = new VoteEvent(req.body); await n.save(); res.json(n); });
-app.post('/api/cast-vote', async (req, res) => { const event = await VoteEvent.findOne(); if(event) { event.currentVotes += 1; await event.save(); res.json({ votes: event.currentVotes }); } else { res.status(404).json({ error: "No active vote" }); } });
+app.post('/api/cast-vote', authUser, async (req, res) => { const event = await VoteEvent.findOne(); if(event) { event.currentVotes += 1; await event.save(); res.json({ votes: event.currentVotes }); } else { res.status(404).json({ error: "No active vote" }); } });
 
 app.post('/api/generate-code', auth, async (req, res) => { const { pcId, pcName } = req.body; const code = 'CDX-' + crypto.randomBytes(3).toString('hex').toUpperCase(); const ticket = new ReviewTicket({ code, pcId, pcName }); await ticket.save(); res.json(ticket); });
 app.get('/api/tickets', auth, async (req, res) => { const tickets = await ReviewTicket.find().sort({ generatedAt: -1 }); res.json(tickets); });
