@@ -73,10 +73,31 @@ const pcSchema = new mongoose.Schema({
     images: [String], status: { type: String, default: 'available' }, category: { type: String, default: 'drop' },    
     multitasking: { type: Number, default: 0 },
     specs: { cpu: String, gpu: String, ram: String, ssd: String, mobo: String, psu: String, case: String },
-    specDetails: { type: Map, of: String, default: {} }, 
+    specDetails: { type: Map, of: String, default: {} },
     fps: [{ game: String, score: Number }],
     reviews: [{ user: String, text: String, rating: Number, date: { type: Date, default: Date.now } }],
-    votes: { type: Number, default: 0 }
+    votes: { type: Number, default: 0 },
+    // Per-build purchasable extras. Every sub-field has a default so PCs created before this
+    // existed still render (the frontend also guards with optional chaining).
+    options: {
+        storage: {
+            enabled: { type: Boolean, default: true },
+            hdd: { type: Number, default: 50 },   // 0 hides that line from the dropdown
+            ssd: { type: Number, default: 80 }
+        },
+        // Pro Config price is global (SiteConfig.proConfigPrice) — the service is identical on
+        // every build, so only availability is per-PC.
+        proConfig: { enabled: { type: Boolean, default: false } },
+        paint: {
+            enabled: { type: Boolean, default: false },
+            colorName: { type: String, default: '' },
+            colorNameEl: { type: String, default: '' },
+            colorHex: { type: String, default: '#1a1a1a' },
+            price: { type: Number, default: 40 },
+            leadTimeHours: { type: Number, default: 48 },
+            images: { type: [String], default: [] }
+        }
+    }
 });
 const PC = mongoose.model('PC', pcSchema);
 
@@ -118,7 +139,10 @@ const Newsletter = mongoose.model('Newsletter', newsletterSchema);
 
 const siteConfigSchema = new mongoose.Schema({
     maintenanceMode: { type: Boolean, default: false },
-    maintenanceMessage: { type: String, default: "PHOENIX CODEX is currently undergoing scheduled maintenance. We'll be back online shortly." }
+    maintenanceMessage: { type: String, default: "PHOENIX CODEX is currently undergoing scheduled maintenance. We'll be back online shortly." },
+    // Pro Config is the same service on every build, so its price lives here rather than per-PC.
+    // Exposed publicly through /api/status (the frontend needs it to price the option).
+    proConfigPrice: { type: Number, default: 30 }
 });
 const SiteConfig = mongoose.model('SiteConfig', siteConfigSchema);
 
@@ -165,7 +189,12 @@ app.use('/api', async (req, res, next) => {
 // --- ROUTES ---
 app.get('/api/status', async (req, res) => {
     const config = await SiteConfig.findOne();
-    res.json({ maintenance: !!config?.maintenanceMode, message: config?.maintenanceMessage || null });
+    res.json({
+        maintenance: !!config?.maintenanceMode,
+        message: config?.maintenanceMessage || null,
+        // Public on purpose: the storefront prices the Pro Config extra from this.
+        proConfigPrice: config?.proConfigPrice ?? 30
+    });
 });
 
 app.get('/api/site-config', auth, async (req, res) => {
@@ -175,11 +204,14 @@ app.get('/api/site-config', auth, async (req, res) => {
 });
 
 app.post('/api/site-config', auth, async (req, res) => {
-    const { maintenanceMode, maintenanceMessage } = req.body;
+    const { maintenanceMode, maintenanceMessage, proConfigPrice } = req.body;
     let config = await SiteConfig.findOne();
     if (!config) config = new SiteConfig();
     if (typeof maintenanceMode === 'boolean') config.maintenanceMode = maintenanceMode;
     if (typeof maintenanceMessage === 'string') config.maintenanceMessage = maintenanceMessage;
+    if (proConfigPrice !== undefined && !Number.isNaN(Number(proConfigPrice))) {
+        config.proConfigPrice = Math.max(0, Number(proConfigPrice));
+    }
     await config.save();
     res.json({ success: true, config });
 });
