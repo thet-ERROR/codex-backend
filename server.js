@@ -24,9 +24,12 @@ app.use(helmet.crossOriginResourcePolicy({ policy: "cross-origin" }));
 
 // --- 🛡️ SECURITY LAYER 2: CORS ---
 const corsOptions = {
-    origin: process.env.FRONTEND_URL || '*', 
+    origin: process.env.FRONTEND_URL || '*',
     methods: ['GET', 'POST', 'PUT', 'DELETE'],
-    allowedHeaders: ['Content-Type', 'x-admin-auth']
+    // Missing 'Authorization' here made the browser block every request carrying the user JWT
+    // (login persistence /api/me, /api/cast-vote, /api/wishlist, /api/achievements) at the CORS
+    // preflight stage — a silent failure that looked like the vote button "just not working".
+    allowedHeaders: ['Content-Type', 'x-admin-auth', 'Authorization']
 };
 app.use(cors(corsOptions));
 app.use(express.json());
