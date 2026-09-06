@@ -454,6 +454,12 @@ app.get('/api/status', async (req, res) => {
         cors: {
             configured: ALLOWED_ORIGINS.length > 0,
             originAllowed: req.headers.origin ? isOriginAllowed(req.headers.origin) : null
+        },
+        // Same idea for email: says only whether the keys are present, never their values, so a
+        // silently undelivered verification mail is a one-request check instead of a log hunt.
+        email: {
+            configured: !!(MAILJET_API_KEY && MAILJET_SECRET_KEY && EMAIL_FROM),
+            sender: EMAIL_FROM || null
         }
     });
 });
