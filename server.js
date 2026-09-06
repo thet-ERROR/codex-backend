@@ -433,13 +433,13 @@ app.post('/api/register', authLimiter, requireAuthConfig, async (req, res) => {
         if (subscribed) {
             try { await new Newsletter({ email }).save(); } catch (e) { console.error("Newsletter subscribe failed:", e); }
         }
-        try {
-            await sendVerificationEmail(newUser, rawVerifyToken);
-        } catch (e) {
-            // The account still exists and can request a fresh link via /api/resend-verification,
-            // so a flaky mail send here shouldn't fail the whole registration.
-            console.error("Verification email send failed:", e);
-        }
+        // Fire-and-forget: NOT awaited. Gmail SMTP occasionally takes several seconds (or hangs)
+        // to respond, and this used to block the response until it finished — from the browser's
+        // side that looked exactly like clicking Register "did nothing", even though the account
+        // was already saved above. The account still exists and can request a fresh link via
+        // /api/resend-verification, so a slow or failed send here must never hold up the reply.
+        sendVerificationEmail(newUser, rawVerifyToken).catch(e => console.error("Verification email send failed:", e));
+
         const token = jwt.sign({ id: newUser._id, username: newUser.username, tokenVersion: newUser.tokenVersion }, JWT_SECRET, { expiresIn: '30d' });
         res.json({ success: true, username: newUser.username, token, emailVerified: false });
     } catch (e) { console.error("Register failed:", e); res.status(500).json({ error: "Error" }); }
@@ -473,7 +473,8 @@ app.post('/api/resend-verification', authLimiter, authUser, async (req, res) => 
         if (user.emailVerified) return res.json({ success: true, alreadyVerified: true });
         const rawVerifyToken = issueEmailVerification(user);
         await user.save();
-        await sendVerificationEmail(user, rawVerifyToken);
+        // Same reasoning as /api/register — don't let a slow mail server hold up the response.
+        sendVerificationEmail(user, rawVerifyToken).catch(e => console.error("Resend verification email send failed:", e));
         res.json({ success: true });
     } catch (e) { console.error("Resend verification failed:", e); res.status(500).json({ error: "Server Error" }); }
 });
