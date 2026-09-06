@@ -37,7 +37,12 @@ const corsOptions = {
         // No Origin header = same-origin, curl, or a mobile app — nothing for CORS to protect
         if (!origin) return callback(null, true);
         if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
-        callback(new Error('Origin not allowed by CORS'));
+
+        // Refuse by omitting the CORS headers rather than throwing: a thrown error here becomes
+        // an opaque 500 on every request, which looks like the API is down instead of like a
+        // misconfigured allowlist. Logged so the exact value to add is visible in the logs.
+        console.error(`⛔ CORS refused origin "${origin}". FRONTEND_URL currently allows: ${ALLOWED_ORIGINS.join(', ') || '(nothing — env var not set)'}`);
+        callback(null, false);
     },
     methods: ['GET', 'POST', 'PUT', 'DELETE'],
     // 'Authorization' carries the user/admin JWT. Leaving it out made the browser block every
