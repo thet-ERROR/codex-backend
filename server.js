@@ -2,7 +2,6 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const mongoose = require('mongoose');
-const path = require('path');
 const crypto = require('crypto');
 const nodemailer = require('nodemailer');
 const bcrypt = require('bcrypt');
@@ -75,6 +74,46 @@ const authLimiter = rateLimit({
     max: 50,
     message: { error: "⛔ ACCESS DENIED: Max authentication attempts reached." }
 });
+
+// Tighter, IP-based, specifically for the two password-guessing endpoints (user + admin login).
+// 50/hour was shared with register/forgot/reset too — generous enough for password guessing,
+// and meant one IP hammering login could also lock a genuine user out of forgot-password.
+const loginLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 10,
+    message: { error: "⛔ ACCESS DENIED: Too many login attempts. Try again in 15 minutes." }
+});
+
+// Per-ACCOUNT lockout, independent of the IP-based limiters above. Those stop one IP from
+// hammering the API; this stops credential stuffing against one specific account from many
+// rotating IPs, which the IP limiter alone can't see. In-memory, so it resets on a redeploy or
+// when the free-tier dyno sleeps — an acceptable trade for this site's scale. A periodic sweep
+// keeps the map from growing unbounded if someone tries thousands of fake usernames.
+const failedLogins = new Map(); // key (e.g. "user:bob" or "admin") -> { count, windowStart, lockedUntil }
+const LOGIN_MAX_ATTEMPTS = 5;
+const LOGIN_LOCKOUT_MS = 15 * 60 * 1000;
+
+function accountLockMinutesLeft(key) {
+    const entry = failedLogins.get(key);
+    if (!entry || !entry.lockedUntil || Date.now() >= entry.lockedUntil) return 0;
+    return Math.ceil((entry.lockedUntil - Date.now()) / 60000);
+}
+function recordFailedLogin(key) {
+    const now = Date.now();
+    const entry = failedLogins.get(key);
+    const fresh = !entry || (now - entry.windowStart) > LOGIN_LOCKOUT_MS;
+    const next = fresh ? { count: 1, windowStart: now, lockedUntil: 0 } : { ...entry, count: entry.count + 1 };
+    if (next.count >= LOGIN_MAX_ATTEMPTS) next.lockedUntil = now + LOGIN_LOCKOUT_MS;
+    failedLogins.set(key, next);
+}
+function clearFailedLogins(key) { failedLogins.delete(key); }
+
+setInterval(() => {
+    const now = Date.now();
+    for (const [key, entry] of failedLogins) {
+        if (now >= entry.lockedUntil && (now - entry.windowStart) > LOGIN_LOCKOUT_MS) failedLogins.delete(key);
+    }
+}, 10 * 60 * 1000).unref();
 
 // --- 🛡️ SECURITY LAYER 4: PREVENT API CACHING (GHOST CACHE FIX) ---
 app.use('/api', (req, res, next) => {
@@ -155,7 +194,19 @@ const userSchema = new mongoose.Schema({
     resetToken: String,
     resetTokenExpiry: Date,
     wishlist: [{ type: mongoose.Schema.Types.ObjectId, ref: 'PC' }],
-    achievements: { type: [String], default: [] }
+    achievements: { type: [String], default: [] },
+    // Baked into every issued JWT and checked on every authenticated request (see authUser).
+    // Bumping this instantly invalidates every token already out there for this account — the
+    // only way to kill a stolen session, since the API has no other server-side session store.
+    // Bumped automatically on password reset.
+    tokenVersion: { type: Number, default: 0 },
+    // Hard gate: nothing account-specific (dossier, wishlist, achievements, voting) works until
+    // this is true. Protects the one-vote-per-account guarantee from being trivially defeated by
+    // mass-registering with throwaway addresses — without this, "one vote per account" only ever
+    // meant "one vote per email you were willing to type," which costs nothing to fake.
+    emailVerified: { type: Boolean, default: false },
+    emailVerifyTokenHash: String,
+    emailVerifyExpiry: Date
 });
 const User = mongoose.model('User', userSchema);
 
@@ -230,18 +281,61 @@ const auth = (req, res, next) => {
     }
 };
 
-const authUser = (req, res, next) => {
+const authUser = async (req, res, next) => {
     if (!JWT_SECRET) return res.status(503).json({ error: "SERVER MISCONFIGURED: authentication unavailable" });
     const token = bearerToken(req);
     if (!token) return res.status(401).json({ error: "ACCESS DENIED: NO TOKEN PROVIDED" });
     try {
         const decoded = jwt.verify(token, JWT_SECRET);
+        // A valid signature only proves the token was once legitimately issued — tokenVersion is
+        // what lets a password reset actually kill an older token instead of leaving it valid for
+        // the rest of its 30-day life. Costs one extra lookup per request; worth it for a revoke
+        // path that otherwise doesn't exist at all with pure stateless JWTs.
+        const user = await User.findById(decoded.id).select('tokenVersion emailVerified');
+        if (!user || user.tokenVersion !== decoded.tokenVersion) {
+            return res.status(401).json({ error: "ACCESS DENIED: SESSION REVOKED, PLEASE LOG IN AGAIN" });
+        }
         req.userId = decoded.id;
+        req.emailVerified = user.emailVerified;
         next();
     } catch (e) {
         res.status(401).json({ error: "ACCESS DENIED: INVALID OR EXPIRED TOKEN" });
     }
 };
+
+// Chain after authUser on any route that must be hard-gated behind a verified email (dossier,
+// wishlist, achievements, voting). `code` lets the frontend distinguish this from a plain auth
+// failure and show "check your email" instead of "please log in".
+const requireVerified = (req, res, next) => {
+    if (!req.emailVerified) {
+        return res.status(403).json({ error: "EMAIL NOT VERIFIED", code: "EMAIL_NOT_VERIFIED" });
+    }
+    next();
+};
+
+// Shared by /api/register and /api/resend-verification. Stores only the hash (same reasoning as
+// the password-reset token) and returns the raw value, which is what actually goes in the email.
+function issueEmailVerification(user) {
+    const rawToken = crypto.randomBytes(32).toString('hex');
+    user.emailVerifyTokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
+    user.emailVerifyExpiry = Date.now() + 24 * 60 * 60 * 1000; // 24h
+    return rawToken;
+}
+
+async function sendVerificationEmail(user, rawToken) {
+    // Points at the frontend, not the API — verification is done by that page's own POST call
+    // once it loads (js/main.js), never by whatever GETs the link itself (a mail client's link
+    // scanner never runs the page's JavaScript). Falls back to the API URL only if no frontend
+    // origin is configured, so verification is never completely undeliverable.
+    const base = ALLOWED_ORIGINS[0] || `https://codex-backend-9kij.onrender.com`;
+    const link = `${base}/?verify=${rawToken}`;
+    await transporter.sendMail({
+        from: 'CODEX SYSTEMS',
+        to: user.email,
+        subject: '✅ CONFIRM YOUR AGENT IDENTITY',
+        text: `AGENT ${user.username},\n\nConfirm your email to unlock your dossier, wishlist and voting rights:\n${link}\n\nThis link is valid for 24 hours.\n- CODEX HQ`
+    });
+}
 
 // --- 🛡️ SECURITY LAYER 5: MAINTENANCE KILL SWITCH ---
 // Lets the admin keep working on the site while it's in maintenance for everyone else
@@ -288,22 +382,26 @@ app.get('/api/status', async (req, res) => {
 });
 
 app.get('/api/site-config', auth, async (req, res) => {
-    let config = await SiteConfig.findOne();
-    if (!config) config = await new SiteConfig().save();
-    res.json(config);
+    try {
+        let config = await SiteConfig.findOne();
+        if (!config) config = await new SiteConfig().save();
+        res.json(config);
+    } catch (e) { console.error("Get site-config failed:", e); res.status(500).json({ error: "Server Error" }); }
 });
 
 app.post('/api/site-config', auth, async (req, res) => {
-    const { maintenanceMode, maintenanceMessage, proConfigPrice } = req.body;
-    let config = await SiteConfig.findOne();
-    if (!config) config = new SiteConfig();
-    if (typeof maintenanceMode === 'boolean') config.maintenanceMode = maintenanceMode;
-    if (typeof maintenanceMessage === 'string') config.maintenanceMessage = maintenanceMessage;
-    if (proConfigPrice !== undefined && !Number.isNaN(Number(proConfigPrice))) {
-        config.proConfigPrice = Math.max(0, Number(proConfigPrice));
-    }
-    await config.save();
-    res.json({ success: true, config });
+    try {
+        const { maintenanceMode, maintenanceMessage, proConfigPrice } = req.body;
+        let config = await SiteConfig.findOne();
+        if (!config) config = new SiteConfig();
+        if (typeof maintenanceMode === 'boolean') config.maintenanceMode = maintenanceMode;
+        if (typeof maintenanceMessage === 'string') config.maintenanceMessage = maintenanceMessage;
+        if (proConfigPrice !== undefined && !Number.isNaN(Number(proConfigPrice))) {
+            config.proConfigPrice = Math.max(0, Number(proConfigPrice));
+        }
+        await config.save();
+        res.json({ success: true, config });
+    } catch (e) { console.error("Save site-config failed:", e); res.status(500).json({ error: "Server Error" }); }
 });
 
 app.post('/api/register', authLimiter, requireAuthConfig, async (req, res) => {
@@ -327,37 +425,86 @@ app.post('/api/register', authLimiter, requireAuthConfig, async (req, res) => {
         // Checked explicitly — the unique index alone would surface as an unhelpful 500
         if (await User.findOne({ username })) return res.status(400).json({ error: "Username already taken" });
 
-        const salt = await bcrypt.genSalt(10);
+        const salt = await bcrypt.genSalt(12);
         const hashedPassword = await bcrypt.hash(password, salt);
         const newUser = new User({ username, email, password: hashedPassword, subscribed });
+        const rawVerifyToken = issueEmailVerification(newUser);
         await newUser.save();
         if (subscribed) {
             try { await new Newsletter({ email }).save(); } catch (e) { console.error("Newsletter subscribe failed:", e); }
         }
-        const token = jwt.sign({ id: newUser._id, username: newUser.username }, JWT_SECRET, { expiresIn: '30d' });
-        res.json({ success: true, username: newUser.username, token });
+        try {
+            await sendVerificationEmail(newUser, rawVerifyToken);
+        } catch (e) {
+            // The account still exists and can request a fresh link via /api/resend-verification,
+            // so a flaky mail send here shouldn't fail the whole registration.
+            console.error("Verification email send failed:", e);
+        }
+        const token = jwt.sign({ id: newUser._id, username: newUser.username, tokenVersion: newUser.tokenVersion }, JWT_SECRET, { expiresIn: '30d' });
+        res.json({ success: true, username: newUser.username, token, emailVerified: false });
     } catch (e) { console.error("Register failed:", e); res.status(500).json({ error: "Error" }); }
 });
 
-app.post('/api/user-login', authLimiter, requireAuthConfig, async (req, res) => {
+// Public — proving you control the emailed token IS the auth. Called by the frontend's own POST
+// after the verification link's page loads (see js/main.js), never by a bare GET, so a mail
+// client's automatic link-preview scan can't verify an account no one asked it to.
+app.post('/api/verify-email', authLimiter, async (req, res) => {
+    try {
+        const token = asString(req.body.token).trim();
+        if (!token) return res.status(400).json({ success: false, error: "Missing token" });
+        const hashed = crypto.createHash('sha256').update(token).digest('hex');
+        const user = await User.findOne({ emailVerifyTokenHash: hashed, emailVerifyExpiry: { $gt: Date.now() } });
+        if (!user) return res.status(400).json({ success: false, error: "Invalid or expired verification link" });
+        user.emailVerified = true;
+        user.emailVerifyTokenHash = undefined;
+        user.emailVerifyExpiry = undefined;
+        await user.save();
+        res.json({ success: true });
+    } catch (e) { console.error("Verify email failed:", e); res.status(500).json({ success: false, error: "Server Error" }); }
+});
+
+// Requires a valid session but deliberately NOT requireVerified — this is the one way out of the
+// unverified state, so gating it behind the same gate would be a dead end for anyone whose first
+// email never arrived.
+app.post('/api/resend-verification', authLimiter, authUser, async (req, res) => {
+    try {
+        const user = await User.findById(req.userId);
+        if (!user) return res.status(404).json({ error: "User not found" });
+        if (user.emailVerified) return res.json({ success: true, alreadyVerified: true });
+        const rawVerifyToken = issueEmailVerification(user);
+        await user.save();
+        await sendVerificationEmail(user, rawVerifyToken);
+        res.json({ success: true });
+    } catch (e) { console.error("Resend verification failed:", e); res.status(500).json({ error: "Server Error" }); }
+});
+
+app.post('/api/user-login', loginLimiter, requireAuthConfig, async (req, res) => {
     // Coerced to strings first: a body of {"username": {"$ne": null}} would otherwise make
     // findOne match the first user in the collection.
     const username = asString(req.body.username).trim();
     const password = asString(req.body.password);
+    const lockKey = `user:${username.toLowerCase()}`;
     try {
         if (!username || !password) return res.status(400).json({ error: "Invalid Credentials" });
+
+        const lockedMin = accountLockMinutesLeft(lockKey);
+        if (lockedMin > 0) {
+            return res.status(429).json({ error: `Too many failed attempts for this account. Try again in ${lockedMin} minute(s).` });
+        }
+
         const user = await User.findOne({ username });
-        if (!user) return res.status(400).json({ error: "Invalid Credentials" });
+        if (!user) { recordFailedLogin(lockKey); return res.status(400).json({ error: "Invalid Credentials" }); }
         const isMatch = await bcrypt.compare(password, user.password);
         if (isMatch) {
-            const token = jwt.sign({ id: user._id, username: user.username }, JWT_SECRET, { expiresIn: '30d' });
-            res.json({ success: true, username: user.username, token });
+            clearFailedLogins(lockKey);
+            const token = jwt.sign({ id: user._id, username: user.username, tokenVersion: user.tokenVersion }, JWT_SECRET, { expiresIn: '30d' });
+            res.json({ success: true, username: user.username, token, emailVerified: user.emailVerified });
         }
-        else res.status(400).json({ error: "Invalid Credentials" });
+        else { recordFailedLogin(lockKey); res.status(400).json({ error: "Invalid Credentials" }); }
     } catch (e) { console.error("Login failed:", e); res.status(500).json({ error: "Server Error" }); }
 });
 
-app.get('/api/me', authUser, async (req, res) => {
+app.get('/api/me', authUser, requireVerified, async (req, res) => {
     try {
         const user = await User.findById(req.userId).populate('wishlist');
         if (!user) return res.status(404).json({ error: "User not found" });
@@ -365,7 +512,7 @@ app.get('/api/me', authUser, async (req, res) => {
     } catch (e) { console.error("/api/me failed:", e); res.status(500).json({ error: "Server Error" }); }
 });
 
-app.post('/api/wishlist/:pcId', authUser, async (req, res) => {
+app.post('/api/wishlist/:pcId', authUser, requireVerified, async (req, res) => {
     try {
         const user = await User.findById(req.userId);
         if (!user) return res.status(404).json({ error: "User not found" });
@@ -378,7 +525,7 @@ app.post('/api/wishlist/:pcId', authUser, async (req, res) => {
     } catch (e) { console.error("Wishlist add failed:", e); res.status(500).json({ error: "Server Error" }); }
 });
 
-app.delete('/api/wishlist/:pcId', authUser, async (req, res) => {
+app.delete('/api/wishlist/:pcId', authUser, requireVerified, async (req, res) => {
     try {
         const user = await User.findById(req.userId);
         if (!user) return res.status(404).json({ error: "User not found" });
@@ -389,7 +536,7 @@ app.delete('/api/wishlist/:pcId', authUser, async (req, res) => {
     } catch (e) { console.error("Wishlist remove failed:", e); res.status(500).json({ error: "Server Error" }); }
 });
 
-app.post('/api/achievements', authUser, async (req, res) => {
+app.post('/api/achievements', authUser, requireVerified, async (req, res) => {
     try {
         const { id } = req.body;
         const user = await User.findById(req.userId);
@@ -442,36 +589,69 @@ app.post('/api/reset-password', authLimiter, async (req, res) => {
         const hashed = crypto.createHash('sha256').update(token).digest('hex');
         const user = await User.findOne({ resetToken: hashed, resetTokenExpiry: { $gt: Date.now() } });
         if (!user) return res.status(400).json({ error: "Invalid Token" });
-        const salt = await bcrypt.genSalt(10);
+        const salt = await bcrypt.genSalt(12);
         user.password = await bcrypt.hash(newPass, salt);
         user.resetToken = undefined;
         user.resetTokenExpiry = undefined;
+        // Invalidates every token issued before this moment — if the reset was prompted by a
+        // compromised account, whoever had the old session is logged out right now, not just
+        // whenever their 30-day token happens to expire.
+        user.tokenVersion = (user.tokenVersion || 0) + 1;
         await user.save();
         res.json({ success: true });
     } catch (e) { res.status(500).json({ error: "Error" }); }
 });
 
 app.get('/api/users/count', auth, async (req, res) => { const count = await User.countDocuments(); res.json({ count }); });
-app.post('/api/login', authLimiter, requireAuthConfig, (req, res) => {
+app.post('/api/login', loginLimiter, requireAuthConfig, (req, res) => {
     const supplied = asString(req.body.password);
     if (!ADMIN_PASSWORD) return res.status(503).json({ success: false, error: "ADMIN PASSWORD NOT CONFIGURED" });
+
+    // Only one admin account exists, so a single fixed key is enough to lock it out after
+    // repeated failures — same account-lockout mechanism as user-login, above.
+    const lockedMin = accountLockMinutesLeft('admin');
+    if (lockedMin > 0) {
+        return res.status(429).json({ success: false, error: `Too many failed attempts. Try again in ${lockedMin} minute(s).` });
+    }
 
     // Constant-time compare: a plain === leaks how many leading characters were right, which is
     // enough to recover a password one byte at a time. Hashing both sides first keeps the
     // buffers equal-length, which timingSafeEqual requires.
     const a = crypto.createHash('sha256').update(supplied).digest();
     const b = crypto.createHash('sha256').update(ADMIN_PASSWORD).digest();
-    if (!crypto.timingSafeEqual(a, b)) return res.status(403).json({ success: false });
+    if (!crypto.timingSafeEqual(a, b)) { recordFailedLogin('admin'); return res.status(403).json({ success: false }); }
 
+    clearFailedLogins('admin');
     // The panel gets a scoped, expiring token instead of holding the password in a JS variable
     const token = jwt.sign({ role: 'admin' }, JWT_SECRET, { expiresIn: '8h' });
     res.json({ success: true, token });
 });
 
-app.get('/api/drops', async (req, res) => { const all = await PC.find(); res.json(all); });
-app.post('/api/drops', auth, async (req, res) => { const n = new PC(req.body); await n.save(); res.json(n); });
-app.put('/api/drops/:id', auth, async (req, res) => { const u = await PC.findByIdAndUpdate(req.params.id, req.body, {new:true}); res.json(u); });
-app.delete('/api/drops/:id', auth, async (req, res) => { await PC.findByIdAndDelete(req.params.id); res.json({msg:"Deleted"}); });
+app.get('/api/drops', async (req, res) => {
+    try { res.json(await PC.find()); }
+    catch (e) { console.error("Fetch drops failed:", e); res.status(500).json({ error: "Server Error" }); }
+});
+app.post('/api/drops', auth, async (req, res) => {
+    try { const n = new PC(req.body); await n.save(); res.json(n); }
+    catch (e) { console.error("Create drop failed:", e); res.status(400).json({ error: "Invalid system data" }); }
+});
+app.put('/api/drops/:id', auth, async (req, res) => {
+    try {
+        // findByIdAndUpdate throws a CastError on a malformed :id (not a valid ObjectId) — was
+        // uncaught here, which without this try/catch depends on the global error handler below
+        // (and, before that existed, could surface a raw stack trace instead of a clean 400).
+        const u = await PC.findByIdAndUpdate(req.params.id, req.body, { new: true, runValidators: true });
+        if (!u) return res.status(404).json({ error: "PC not found" });
+        res.json(u);
+    } catch (e) { console.error("Update drop failed:", e); res.status(400).json({ error: "Invalid system data or id" }); }
+});
+app.delete('/api/drops/:id', auth, async (req, res) => {
+    try {
+        const deleted = await PC.findByIdAndDelete(req.params.id);
+        if (!deleted) return res.status(404).json({ error: "PC not found" });
+        res.json({ msg: "Deleted" });
+    } catch (e) { console.error("Delete drop failed:", e); res.status(400).json({ error: "Invalid id" }); }
+});
 
 app.get('/api/vote-event', async (req, res) => {
     try {
@@ -519,8 +699,15 @@ app.get('/api/vote-event', async (req, res) => {
         res.json({});
     }
 });
-app.post('/api/vote-event', auth, async (req, res) => { await VoteEvent.deleteMany({}); const n = new VoteEvent(req.body); await n.save(); res.json(n); });
-app.post('/api/cast-vote', authUser, async (req, res) => {
+app.post('/api/vote-event', auth, async (req, res) => {
+    try {
+        await VoteEvent.deleteMany({});
+        const n = new VoteEvent(req.body);
+        await n.save();
+        res.json(n);
+    } catch (e) { console.error("Create vote-event failed:", e); res.status(400).json({ error: "Invalid vote event data" }); }
+});
+app.post('/api/cast-vote', authUser, requireVerified, async (req, res) => {
     try {
         const event = await VoteEvent.findOne();
         if (!event) return res.status(404).json({ error: "No active vote" });
@@ -549,7 +736,18 @@ app.post('/api/cast-vote', authUser, async (req, res) => {
     }
 });
 
-app.post('/api/generate-code', auth, async (req, res) => { const { pcId, pcName } = req.body; const code = 'CDX-' + crypto.randomBytes(3).toString('hex').toUpperCase(); const ticket = new ReviewTicket({ code, pcId, pcName }); await ticket.save(); res.json(ticket); });
+app.post('/api/generate-code', auth, async (req, res) => {
+    try {
+        const { pcId, pcName } = req.body;
+        // 5 bytes = 10 hex chars ≈ 1.1 trillion combinations (was 3 bytes / 6 chars ≈ 16.7
+        // million) — the smaller space was small enough that a distributed brute-force against
+        // /api/check-code could plausibly land on a real pending code within its lifetime.
+        const code = 'CDX-' + crypto.randomBytes(5).toString('hex').toUpperCase();
+        const ticket = new ReviewTicket({ code, pcId, pcName });
+        await ticket.save();
+        res.json(ticket);
+    } catch (e) { console.error("Generate code failed:", e); res.status(500).json({ error: "Server Error" }); }
+});
 app.get('/api/tickets', auth, async (req, res) => { const tickets = await ReviewTicket.find().sort({ generatedAt: -1 }); res.json(tickets); });
 
 app.post('/api/activate-ticket/:id', auth, async (req, res) => {
@@ -560,14 +758,33 @@ app.post('/api/activate-ticket/:id', auth, async (req, res) => {
     } catch(e) { res.status(500).json({ error: "Server error" }); }
 });
 
-app.get('/api/check-code/:code', async (req, res) => {
+// Read-only on purpose. This used to start the 48h validation window as a side effect of a GET
+// — meaning any automated client that fetches URLs (a chat app's link-preview bot, an uptime
+// monitor, a crawler, a browser prefetch) could silently burn a customer's window before they
+// ever typed the code in. GET now only ever reports status; POST /activate (below) is the only
+// thing that starts the clock, and only fires from an explicit user action in the frontend.
+app.get('/api/check-code/:code', authLimiter, async (req, res) => {
     try {
         const ticket = await ReviewTicket.findOne({ code: req.params.code });
         if (!ticket) return res.json({ valid: false, msg: "❌ INVALID CODE" });
         if (ticket.status === 'used') return res.json({ valid: false, msg: "⚠️ ALREADY REDEEMED" });
+        if (!ticket.firstScan) return res.json({ valid: true, activated: false, pcName: ticket.pcName });
+        const now = new Date(); const expiry = new Date(ticket.firstScan); expiry.setHours(expiry.getHours() + 48);
+        if (now > expiry) { return res.json({ valid: true, activated: true, expired: true, pcName: ticket.pcName }); }
+        res.json({ valid: true, activated: true, expired: false, pcName: ticket.pcName, timeLeft: expiry - now });
+    } catch(e) { console.error(e); res.status(500).json({ valid: false, msg: "SERVER ERROR" }); }
+});
+
+// The only route that starts the 48h window. Idempotent: calling it again after activation just
+// returns the already-running timer instead of resetting it, so a retried request can't extend it.
+app.post('/api/check-code/:code/activate', authLimiter, async (req, res) => {
+    try {
+        const ticket = await ReviewTicket.findOne({ code: req.params.code });
+        if (!ticket) return res.status(404).json({ valid: false, msg: "❌ INVALID CODE" });
+        if (ticket.status === 'used') return res.status(409).json({ valid: false, msg: "⚠️ ALREADY REDEEMED" });
         if (!ticket.firstScan) { ticket.firstScan = new Date(); ticket.status = 'active'; await ticket.save(); }
         const now = new Date(); const expiry = new Date(ticket.firstScan); expiry.setHours(expiry.getHours() + 48);
-        if (now > expiry) { return res.json({ valid: true, expired: true, pcName: ticket.pcName }); }
+        if (now > expiry) return res.json({ valid: true, expired: true, pcName: ticket.pcName });
         res.json({ valid: true, expired: false, pcName: ticket.pcName, timeLeft: expiry - now });
     } catch(e) { console.error(e); res.status(500).json({ valid: false, msg: "SERVER ERROR" }); }
 });
@@ -620,6 +837,26 @@ app.post('/api/newsletter', authLimiter, async (req, res) => {
     await new Newsletter({ email }).save();
     res.json({ success: true });
 });
-app.get('/api/newsletter', auth, async (req, res) => { const subs = await Newsletter.find().sort({ date: -1 }); res.json(subs); });
+app.get('/api/newsletter', auth, async (req, res) => {
+    try { res.json(await Newsletter.find().sort({ date: -1 })); }
+    catch (e) { console.error("Fetch newsletter failed:", e); res.status(500).json({ error: "Server Error" }); }
+});
+
+// --- 🛡️ SECURITY LAYER 6: UNKNOWN ROUTES & UNCAUGHT ERRORS ---
+// Anything under /api/ that doesn't match a route above (typos, probing, old client versions)
+app.use('/api', (req, res) => res.status(404).json({ error: "Not Found" }));
+
+// Final safety net. Express 5 auto-forwards a rejected promise from any async handler here, so
+// without this, an error from a route with no try/catch of its own falls through to Express's
+// built-in handler — which prints a full stack trace (file paths, package versions, internal
+// structure) to the client whenever NODE_ENV isn't exactly 'production'. This runs first and
+// unconditionally, so the response is always the same generic message no matter how NODE_ENV
+// ends up configured on the host. Must be the last app.use() — Express only routes to an error
+// handler (4-arg signature) that's registered after the route that threw.
+app.use((err, req, res, next) => {
+    console.error("🚨 UNCAUGHT ERROR:", err);
+    if (res.headersSent) return next(err);
+    res.status(500).json({ error: "Server Error" });
+});
 
 app.listen(PORT, '0.0.0.0', () => { console.log(`🚀 Server running on port ${PORT}`); });
