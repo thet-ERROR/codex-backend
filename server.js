@@ -603,6 +603,27 @@ app.post('/api/reset-password', authLimiter, async (req, res) => {
 });
 
 app.get('/api/users/count', auth, async (req, res) => { const count = await User.countDocuments(); res.json({ count }); });
+
+// Admin user management — added so test/duplicate accounts (which block re-registering an email,
+// by design — see /api/register's uniqueness check) can be cleared from the panel instead of
+// needing direct database access every time. Password hash and tokens are never selected.
+app.get('/api/users', auth, async (req, res) => {
+    try {
+        const users = await User.find()
+            .select('username email joined subscribed emailVerified wishlist achievements')
+            .sort({ joined: -1 })
+            .limit(500); // demo-scale cap — swap for real pagination if the user base grows
+        res.json(users);
+    } catch (e) { console.error("List users failed:", e); res.status(500).json({ error: "Server Error" }); }
+});
+
+app.delete('/api/users/:id', auth, async (req, res) => {
+    try {
+        const deleted = await User.findByIdAndDelete(req.params.id);
+        if (!deleted) return res.status(404).json({ error: "User not found" });
+        res.json({ success: true });
+    } catch (e) { console.error("Delete user failed:", e); res.status(400).json({ error: "Invalid user id" }); }
+});
 app.post('/api/login', loginLimiter, requireAuthConfig, (req, res) => {
     const supplied = asString(req.body.password);
     if (!ADMIN_PASSWORD) return res.status(503).json({ success: false, error: "ADMIN PASSWORD NOT CONFIGURED" });
