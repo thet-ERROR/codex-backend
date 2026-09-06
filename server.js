@@ -1,4 +1,12 @@
-require('dotenv').config(); 
+require('dotenv').config();
+
+// Render's outbound network has no IPv6 route. smtp.gmail.com resolves to both an A (IPv4) and
+// AAAA (IPv6) record, and Node's default DNS resolution tries the IPv6 address first — every
+// email send was hanging on that with ETIMEDOUT/ENETUNREACH and only ever reaching Gmail on a
+// later retry, if at all. Forcing IPv4-first here (Node 17+) fixes it for every SMTP connection
+// nodemailer opens, without needing per-call options at each transporter.sendMail() call site.
+require('dns').setDefaultResultOrder('ipv4first');
+
 const express = require('express');
 const cors = require('cors');
 const mongoose = require('mongoose');
@@ -257,7 +265,11 @@ const transporter = nodemailer.createTransport({
     auth: {
         user: process.env.EMAIL_USER,
         pass: process.env.EMAIL_PASS
-    }
+    },
+    // Belt-and-suspenders alongside the dns.setDefaultResultOrder above, right at the exact
+    // socket that was failing: forces every connection this transporter opens onto IPv4, since
+    // Render has no outbound route to smtp.gmail.com's IPv6 address.
+    family: 4
 });
 
 const bearerToken = (req) => {
