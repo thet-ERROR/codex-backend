@@ -122,10 +122,20 @@ const voteEventSchema = new mongoose.Schema({
     image: String,
     targetVotes: Number,
     currentVotes: { type: Number, default: 0 },
+    // One vote per account: the ledger of who already voted. Never sent to the browser — the
+    // public endpoint replaces it with a plain hasVoted boolean for the requesting agent.
+    votedBy: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
     startDate: Date,
     durationDays: Number,
     price: String,
-    specs: { cpu: String, gpu: String, ram: String, ssd: String, mobo: String, psu: String, case: String }
+    specs: { cpu: String, gpu: String, ram: String, ssd: String, mobo: String, psu: String, case: String },
+    // Mirrors the PC fields so the vote drop can open in the same inspect card as every other
+    // build (flip to specs, show FPS, lore on the front).
+    description: String,
+    lore: String,
+    loreEl: String,
+    multitasking: { type: Number, default: 0 },
+    fps: [{ game: String, score: Number }]
 });
 const VoteEvent = mongoose.model('VoteEvent', voteEventSchema);
 
@@ -360,14 +370,57 @@ app.get('/api/vote-event', async (req, res) => {
                 return res.json({});
             }
         }
-        res.json(event || {});
+        if (!event) return res.json({});
+
+        // Optional auth: this route stays public (guests must still see the drop), but when a
+        // valid token is present we tell that agent whether they've already used their vote.
+        let hasVoted = false;
+        const header = req.headers['authorization'] || '';
+        const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+        if (token && JWT_SECRET) {
+            try {
+                const decoded = jwt.verify(token, JWT_SECRET);
+                hasVoted = (event.votedBy || []).some(id => id.toString() === decoded.id);
+            } catch (e) { /* expired/invalid token: treat as a guest */ }
+        }
+
+        const payload = event.toObject();
+        delete payload.votedBy; // never leak the voter list
+        res.json({ ...payload, hasVoted });
     } catch (e) {
         console.error("Vote event fetch/expiry check failed:", e);
         res.json({});
     }
 });
 app.post('/api/vote-event', auth, async (req, res) => { await VoteEvent.deleteMany({}); const n = new VoteEvent(req.body); await n.save(); res.json(n); });
-app.post('/api/cast-vote', authUser, async (req, res) => { const event = await VoteEvent.findOne(); if(event) { event.currentVotes += 1; await event.save(); res.json({ votes: event.currentVotes }); } else { res.status(404).json({ error: "No active vote" }); } });
+app.post('/api/cast-vote', authUser, async (req, res) => {
+    try {
+        const event = await VoteEvent.findOne();
+        if (!event) return res.status(404).json({ error: "No active vote" });
+
+        // One vote per account — this is what makes the counter mean anything
+        if ((event.votedBy || []).some(id => id.toString() === req.userId)) {
+            return res.status(409).json({ error: "ALREADY VOTED", votes: event.currentVotes, hasVoted: true });
+        }
+
+        // The client disables the button outside the window, but the API has to enforce it too
+        if (event.startDate) {
+            const now = new Date();
+            const start = new Date(event.startDate);
+            const end = new Date(start.getTime() + (event.durationDays || 0) * 24 * 60 * 60 * 1000);
+            if (now < start) return res.status(403).json({ error: "VOTING HAS NOT OPENED YET" });
+            if (now > end) return res.status(403).json({ error: "VOTING HAS CLOSED" });
+        }
+
+        event.votedBy.push(req.userId);
+        event.currentVotes += 1;
+        await event.save();
+        res.json({ votes: event.currentVotes, hasVoted: true });
+    } catch (e) {
+        console.error("Cast vote failed:", e);
+        res.status(500).json({ error: "Server Error" });
+    }
+});
 
 app.post('/api/generate-code', auth, async (req, res) => { const { pcId, pcName } = req.body; const code = 'CDX-' + crypto.randomBytes(3).toString('hex').toUpperCase(); const ticket = new ReviewTicket({ code, pcId, pcName }); await ticket.save(); res.json(ticket); });
 app.get('/api/tickets', auth, async (req, res) => { const tickets = await ReviewTicket.find().sort({ generatedAt: -1 }); res.json(tickets); });
