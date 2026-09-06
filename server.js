@@ -1,17 +1,15 @@
 require('dotenv').config();
 
-// Render's outbound network has no IPv6 route. smtp.gmail.com resolves to both an A (IPv4) and
-// AAAA (IPv6) record, and Node's default DNS resolution tries the IPv6 address first — every
-// email send was hanging on that with ETIMEDOUT/ENETUNREACH and only ever reaching Gmail on a
-// later retry, if at all. Forcing IPv4-first here (Node 17+) fixes it for every SMTP connection
-// nodemailer opens, without needing per-call options at each transporter.sendMail() call site.
+// Render's outbound network has no IPv6 route, and Node resolves AAAA (IPv6) records first by
+// default — outbound connections to any host with both record types can hang on ENETUNREACH
+// before ever trying IPv4. Applies to every outbound call this server makes (the Mailjet email
+// API, MongoDB Atlas), so it's set once here rather than per call site. Node 17+.
 require('dns').setDefaultResultOrder('ipv4first');
 
 const express = require('express');
 const cors = require('cors');
 const mongoose = require('mongoose');
 const crypto = require('crypto');
-const nodemailer = require('nodemailer');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const helmet = require('helmet');
@@ -154,6 +152,35 @@ const requireAuthConfig = (req, res, next) => {
 // turn findOne() into "match any user". Everything that reaches a query goes through here.
 const asString = v => (typeof v === 'string' ? v : '');
 
+// --- EMAIL ADDRESS SANITY CHECKS ---
+// A format regex alone accepts anything shaped like an address, so "asdf@asdf.com" sails through.
+// These two checks raise the bar cheaply; the verification link remains the real proof of
+// ownership, since only a mailbox that actually receives it can complete signup.
+const DISPOSABLE_EMAIL_DOMAINS = new Set([
+    'mailinator.com', '10minutemail.com', 'guerrillamail.com', 'guerrillamail.net',
+    'tempmail.com', 'temp-mail.org', 'throwawaymail.com', 'yopmail.com', 'trashmail.com',
+    'sharklasers.com', 'getnada.com', 'maildrop.cc', 'fakeinbox.com', 'dispostable.com',
+    'mailnesia.com', 'mintemail.com', 'spamgourmet.com', 'mytemp.email', 'moakt.com',
+    'emailondeck.com', 'burnermail.io', 'tempr.email', 'discard.email', 'mailcatch.com'
+]);
+
+const isDisposableEmail = (email) => DISPOSABLE_EMAIL_DOMAINS.has(email.split('@')[1] || '');
+
+// Confirms the domain actually publishes mail servers — catches invented domains and typos like
+// "gmial.com". Deliberately fails OPEN: a DNS hiccup must never block a legitimate signup.
+async function domainAcceptsMail(email) {
+    const domain = email.split('@')[1];
+    if (!domain) return false;
+    try {
+        const records = await require('dns').promises.resolveMx(domain);
+        return Array.isArray(records) && records.length > 0;
+    } catch (e) {
+        if (e.code === 'ENOTFOUND' || e.code === 'NODATA') return false; // domain has no mail
+        console.error(`MX lookup failed for "${domain}", allowing through:`, e.code);
+        return true;
+    }
+}
+
 console.log("⏳ Connecting to MongoDB...");
 mongoose.connect(dbURI, { serverSelectionTimeoutMS: 30000, socketTimeoutMS: 45000 })
 .then(() => console.log("✅ SERVER ONLINE: DATABASE CONNECTED (SECURE MODE)"))
@@ -260,17 +287,56 @@ const siteConfigSchema = new mongoose.Schema({
 });
 const SiteConfig = mongoose.model('SiteConfig', siteConfigSchema);
 
-const transporter = nodemailer.createTransport({
-    service: 'gmail',
-    auth: {
-        user: process.env.EMAIL_USER,
-        pass: process.env.EMAIL_PASS
-    },
-    // Belt-and-suspenders alongside the dns.setDefaultResultOrder above, right at the exact
-    // socket that was failing: forces every connection this transporter opens onto IPv4, since
-    // Render has no outbound route to smtp.gmail.com's IPv6 address.
-    family: 4
-});
+// --- 📧 EMAIL DELIVERY (Mailjet Send API v3.1) ---
+// Render's free tier blocks outbound SMTP (ports 25/465/587) since Sept 2025, so nodemailer over
+// Gmail could never connect from here — every send died with ETIMEDOUT. This goes out over plain
+// HTTPS instead, which is never blocked. It's also the right tool regardless: Gmail caps at
+// ~500/day, has poor deliverability to strangers, and eventually flags automated sending.
+const MAILJET_API_KEY = process.env.MAILJET_API_KEY;        // "API Key" (public) in Mailjet
+const MAILJET_SECRET_KEY = process.env.MAILJET_SECRET_KEY;  // "Secret Key" (private) in Mailjet
+const EMAIL_FROM = process.env.EMAIL_FROM || process.env.EMAIL_USER;
+const EMAIL_FROM_NAME = process.env.EMAIL_FROM_NAME || 'CODEX SYSTEMS';
+
+if (!MAILJET_API_KEY || !MAILJET_SECRET_KEY) {
+    console.error("🚨 MAILJET_API_KEY / MAILJET_SECRET_KEY not set — no verification or password-reset email can be sent.");
+}
+if (!EMAIL_FROM) {
+    console.error("🚨 EMAIL_FROM is not set — set it to the sender address you validated in Mailjet.");
+}
+
+// Same call shape nodemailer used ({ to, subject, text }) so every existing call site is
+// unchanged. Throws on failure; callers already log and carry on without failing the request.
+async function sendMail({ to, subject, text }) {
+    if (!MAILJET_API_KEY || !MAILJET_SECRET_KEY || !EMAIL_FROM) {
+        throw new Error('Email is not configured (MAILJET_API_KEY / MAILJET_SECRET_KEY / EMAIL_FROM missing)');
+    }
+
+    // Mailjet authenticates with HTTP Basic: "apiKey:secretKey" base64-encoded
+    const credentials = Buffer.from(`${MAILJET_API_KEY}:${MAILJET_SECRET_KEY}`).toString('base64');
+
+    const res = await fetch('https://api.mailjet.com/v3.1/send', {
+        method: 'POST',
+        headers: {
+            'Authorization': `Basic ${credentials}`,
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+            Messages: [{
+                From: { Email: EMAIL_FROM, Name: EMAIL_FROM_NAME },
+                To: [{ Email: to }],
+                Subject: subject,
+                TextPart: text
+            }]
+        })
+    });
+
+    if (!res.ok) {
+        // Mailjet returns a JSON body explaining the rejection (unvalidated sender, bad key, quota)
+        const detail = await res.text().catch(() => '');
+        throw new Error(`Mailjet API ${res.status}: ${detail}`);
+    }
+    return res.json().catch(() => ({}));
+}
 
 const bearerToken = (req) => {
     const header = req.headers['authorization'] || '';
@@ -341,8 +407,7 @@ async function sendVerificationEmail(user, rawToken) {
     // origin is configured, so verification is never completely undeliverable.
     const base = ALLOWED_ORIGINS[0] || `https://codex-backend-9kij.onrender.com`;
     const link = `${base}/?verify=${rawToken}`;
-    await transporter.sendMail({
-        from: 'CODEX SYSTEMS',
+    await sendMail({
         to: user.email,
         subject: '✅ CONFIRM YOUR AGENT IDENTITY',
         text: `AGENT ${user.username},\n\nConfirm your email to unlock your dossier, wishlist and voting rights:\n${link}\n\nThis link is valid for 24 hours.\n- CODEX HQ`
@@ -429,8 +494,15 @@ app.post('/api/register', authLimiter, requireAuthConfig, async (req, res) => {
         if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254) {
             return res.status(400).json({ error: "Please enter a valid email address" });
         }
+        if (isDisposableEmail(email)) {
+            return res.status(400).json({ error: "Temporary/disposable email addresses are not accepted" });
+        }
         if (password.length < 8 || password.length > 200) {
             return res.status(400).json({ error: "Password must be at least 8 characters" });
+        }
+        // Checked after the cheap validations so a DNS round trip only happens for plausible input
+        if (!await domainAcceptsMail(email)) {
+            return res.status(400).json({ error: "That email domain can't receive mail — please check the address" });
         }
 
         if (await User.findOne({ email })) return res.status(400).json({ error: "Email exists" });
@@ -573,8 +645,7 @@ app.post('/api/forgot-password', authLimiter, async (req, res) => {
             user.resetToken = crypto.createHash('sha256').update(token).digest('hex');
             user.resetTokenExpiry = Date.now() + 3600000;
             await user.save();
-            await transporter.sendMail({
-                from: 'CODEX SYSTEMS',
+            await sendMail({
                 to: user.email,
                 subject: '🔐 PASSWORD RECOVERY',
                 text: `AGENT ${user.username},\n\nYOUR RESET TOKEN:\n${token}\n\nValid for 60 minutes.\n- CODEX HQ`
