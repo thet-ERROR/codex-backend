@@ -23,16 +23,30 @@ app.use(helmet());
 app.use(helmet.crossOriginResourcePolicy({ policy: "cross-origin" })); 
 
 // --- 🛡️ SECURITY LAYER 2: CORS ---
+// FRONTEND_URL may hold several comma-separated origins (prod domain + Vercel preview).
+// No '*' fallback: an unset env var must fail closed, not silently open the API to every site.
+const ALLOWED_ORIGINS = (process.env.FRONTEND_URL || '')
+    .split(',').map(o => o.trim()).filter(Boolean);
+
+if (!ALLOWED_ORIGINS.length) {
+    console.error("⚠️ FRONTEND_URL is not set — all browser requests will be refused by CORS.");
+}
+
 const corsOptions = {
-    origin: process.env.FRONTEND_URL || '*',
+    origin(origin, callback) {
+        // No Origin header = same-origin, curl, or a mobile app — nothing for CORS to protect
+        if (!origin) return callback(null, true);
+        if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+        callback(new Error('Origin not allowed by CORS'));
+    },
     methods: ['GET', 'POST', 'PUT', 'DELETE'],
-    // Missing 'Authorization' here made the browser block every request carrying the user JWT
-    // (login persistence /api/me, /api/cast-vote, /api/wishlist, /api/achievements) at the CORS
-    // preflight stage — a silent failure that looked like the vote button "just not working".
-    allowedHeaders: ['Content-Type', 'x-admin-auth', 'Authorization']
+    // 'Authorization' carries the user/admin JWT. Leaving it out made the browser block every
+    // authenticated request at the preflight stage.
+    allowedHeaders: ['Content-Type', 'Authorization']
 };
 app.use(cors(corsOptions));
-app.use(express.json());
+// Cap the body size so a single request can't tie up memory
+app.use(express.json({ limit: '100kb' }));
 
 // --- 🛡️ SECURITY LAYER 3: RATE LIMITING ---
 const apiLimiter = rateLimit({
@@ -62,8 +76,22 @@ const JWT_SECRET = process.env.JWT_SECRET;
 const dbURI = process.env.DB_URI;
 
 if (!JWT_SECRET) {
-    console.error("⚠️ JWT_SECRET is not set in environment variables — every /api/register and /api/user-login call will fail with a 500 until it's added.");
+    console.error("🚨 JWT_SECRET is not set. Every authenticated route (login, register, admin, vote) will refuse to work until it is. Generate one with: node -e \"console.log(require('crypto').randomBytes(48).toString('hex'))\"");
 }
+if (!ADMIN_PASSWORD) {
+    console.error("🚨 ADMIN_PASSWORD is not set. The admin panel cannot be used until it is.");
+}
+
+// Deliberately no fallback secret: a hardcoded default would let anyone mint valid tokens.
+// Auth routes fail closed with a clear 503 instead, so the public catalogue keeps working.
+const requireAuthConfig = (req, res, next) => {
+    if (!JWT_SECRET) return res.status(503).json({ error: "SERVER MISCONFIGURED: authentication unavailable" });
+    next();
+};
+
+// Rejects strings that aren't strings — a JSON body can smuggle {"$ne": null} into a query and
+// turn findOne() into "match any user". Everything that reaches a query goes through here.
+const asString = v => (typeof v === 'string' ? v : '');
 
 console.log("⏳ Connecting to MongoDB...");
 mongoose.connect(dbURI, { serverSelectionTimeoutMS: 30000, socketTimeoutMS: 45000 })
@@ -167,14 +195,30 @@ const transporter = nodemailer.createTransport({
     }
 });
 
+const bearerToken = (req) => {
+    const header = req.headers['authorization'] || '';
+    return header.startsWith('Bearer ') ? header.slice(7) : null;
+};
+
+// Admin routes used to accept the raw password in a header on every single request, compared
+// with ===. That meant the shared secret travelled constantly, never expired, and the compare
+// leaked timing. Now the password is exchanged once at /api/login for a short-lived scoped JWT.
 const auth = (req, res, next) => {
-    if (req.headers['x-admin-auth'] === ADMIN_PASSWORD) next();
-    else res.status(403).json({ error: "⛔ SECURE BREACH DETECTED: WRONG ADMIN PASSWORD" });
+    if (!JWT_SECRET) return res.status(503).json({ error: "SERVER MISCONFIGURED: authentication unavailable" });
+    const token = bearerToken(req);
+    if (!token) return res.status(401).json({ error: "⛔ ACCESS DENIED: ADMIN TOKEN REQUIRED" });
+    try {
+        const decoded = jwt.verify(token, JWT_SECRET);
+        if (decoded.role !== 'admin') return res.status(403).json({ error: "⛔ ACCESS DENIED: NOT AN ADMIN TOKEN" });
+        next();
+    } catch (e) {
+        res.status(401).json({ error: "⛔ ACCESS DENIED: ADMIN SESSION EXPIRED" });
+    }
 };
 
 const authUser = (req, res, next) => {
-    const header = req.headers['authorization'] || '';
-    const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+    if (!JWT_SECRET) return res.status(503).json({ error: "SERVER MISCONFIGURED: authentication unavailable" });
+    const token = bearerToken(req);
     if (!token) return res.status(401).json({ error: "ACCESS DENIED: NO TOKEN PROVIDED" });
     try {
         const decoded = jwt.verify(token, JWT_SECRET);
@@ -186,8 +230,20 @@ const authUser = (req, res, next) => {
 };
 
 // --- 🛡️ SECURITY LAYER 5: MAINTENANCE KILL SWITCH ---
+// Lets the admin keep working on the site while it's in maintenance for everyone else
+const isAdminRequest = (req) => {
+    if (!JWT_SECRET) return false;
+    const token = bearerToken(req);
+    if (!token) return false;
+    try {
+        return jwt.verify(token, JWT_SECRET).role === 'admin';
+    } catch (e) {
+        return false;
+    }
+};
+
 app.use('/api', async (req, res, next) => {
-    if (req.path === '/status' || req.path === '/login' || req.headers['x-admin-auth'] === ADMIN_PASSWORD) return next();
+    if (req.path === '/status' || req.path === '/login' || isAdminRequest(req)) return next();
     try {
         const config = await SiteConfig.findOne();
         if (config?.maintenanceMode) {
@@ -229,13 +285,30 @@ app.post('/api/site-config', auth, async (req, res) => {
     res.json({ success: true, config });
 });
 
-app.post('/api/register', authLimiter, async (req, res) => {
+app.post('/api/register', authLimiter, requireAuthConfig, async (req, res) => {
     try {
-        const { username, email, password, subscribed } = req.body;
+        const username = asString(req.body.username).trim();
+        const email = asString(req.body.email).trim().toLowerCase();
+        const password = asString(req.body.password);
+        const subscribed = req.body.subscribed === true;
+
+        if (username.length < 3 || username.length > 24 || !/^[a-zA-Z0-9_.-]+$/.test(username)) {
+            return res.status(400).json({ error: "Username must be 3-24 characters (letters, numbers, . _ - only)" });
+        }
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254) {
+            return res.status(400).json({ error: "Please enter a valid email address" });
+        }
+        if (password.length < 8 || password.length > 200) {
+            return res.status(400).json({ error: "Password must be at least 8 characters" });
+        }
+
         if (await User.findOne({ email })) return res.status(400).json({ error: "Email exists" });
+        // Checked explicitly — the unique index alone would surface as an unhelpful 500
+        if (await User.findOne({ username })) return res.status(400).json({ error: "Username already taken" });
+
         const salt = await bcrypt.genSalt(10);
         const hashedPassword = await bcrypt.hash(password, salt);
-        const newUser = new User({ username, email, password: hashedPassword, subscribed: !!subscribed });
+        const newUser = new User({ username, email, password: hashedPassword, subscribed });
         await newUser.save();
         if (subscribed) {
             try { await new Newsletter({ email }).save(); } catch (e) { console.error("Newsletter subscribe failed:", e); }
@@ -245,9 +318,13 @@ app.post('/api/register', authLimiter, async (req, res) => {
     } catch (e) { console.error("Register failed:", e); res.status(500).json({ error: "Error" }); }
 });
 
-app.post('/api/user-login', authLimiter, async (req, res) => {
-    const { username, password } = req.body;
+app.post('/api/user-login', authLimiter, requireAuthConfig, async (req, res) => {
+    // Coerced to strings first: a body of {"username": {"$ne": null}} would otherwise make
+    // findOne match the first user in the collection.
+    const username = asString(req.body.username).trim();
+    const password = asString(req.body.password);
     try {
+        if (!username || !password) return res.status(400).json({ error: "Invalid Credentials" });
         const user = await User.findOne({ username });
         if (!user) return res.status(400).json({ error: "Invalid Credentials" });
         const isMatch = await bcrypt.compare(password, user.password);
@@ -304,30 +381,45 @@ app.post('/api/achievements', authUser, async (req, res) => {
     } catch (e) { res.status(500).json({ error: "Server Error" }); }
 });
 
-app.post('/api/forgot-password', async (req, res) => {
-    const { email } = req.body;
+app.post('/api/forgot-password', authLimiter, async (req, res) => {
+    const email = asString(req.body.email).trim().toLowerCase();
     try {
         const user = await User.findOne({ email });
-        if (!user) return res.status(404).json({ error: "Email not found" });
-        const token = crypto.randomBytes(20).toString('hex');
-        user.resetToken = token;
-        user.resetTokenExpiry = Date.now() + 3600000;
-        await user.save();
-        const mailOptions = {
-            from: 'CODEX SYSTEMS',
-            to: user.email,
-            subject: '🔐 PASSWORD RECOVERY',
-            text: `AGENT ${user.username},\n\nYOUR RESET TOKEN:\n${token}\n\nValid for 60 minutes.\n- CODEX HQ`
-        };
-        await transporter.sendMail(mailOptions);
+
+        if (user) {
+            const token = crypto.randomBytes(32).toString('hex');
+            // Only the hash is stored: a leaked database dump then can't be used to reset accounts
+            user.resetToken = crypto.createHash('sha256').update(token).digest('hex');
+            user.resetTokenExpiry = Date.now() + 3600000;
+            await user.save();
+            await transporter.sendMail({
+                from: 'CODEX SYSTEMS',
+                to: user.email,
+                subject: '🔐 PASSWORD RECOVERY',
+                text: `AGENT ${user.username},\n\nYOUR RESET TOKEN:\n${token}\n\nValid for 60 minutes.\n- CODEX HQ`
+            });
+        }
+
+        // Always the same answer, whether or not the address exists — a 404 here would let
+        // anyone test which emails have accounts.
         res.json({ success: true });
-    } catch (e) { console.error(e); res.status(500).json({ error: "Email Failed" }); }
+    } catch (e) {
+        console.error("Password recovery failed:", e);
+        res.json({ success: true });
+    }
 });
 
-app.post('/api/reset-password', async (req, res) => {
-    const { token, newPass } = req.body;
+app.post('/api/reset-password', authLimiter, async (req, res) => {
+    const token = asString(req.body.token).trim();
+    const newPass = asString(req.body.newPass);
     try {
-        const user = await User.findOne({ resetToken: token, resetTokenExpiry: { $gt: Date.now() } });
+        if (!token) return res.status(400).json({ error: "Invalid Token" });
+        if (newPass.length < 8 || newPass.length > 200) {
+            return res.status(400).json({ error: "Password must be at least 8 characters" });
+        }
+        // Compare against the stored hash, not the raw token
+        const hashed = crypto.createHash('sha256').update(token).digest('hex');
+        const user = await User.findOne({ resetToken: hashed, resetTokenExpiry: { $gt: Date.now() } });
         if (!user) return res.status(400).json({ error: "Invalid Token" });
         const salt = await bcrypt.genSalt(10);
         user.password = await bcrypt.hash(newPass, salt);
@@ -339,7 +431,21 @@ app.post('/api/reset-password', async (req, res) => {
 });
 
 app.get('/api/users/count', auth, async (req, res) => { const count = await User.countDocuments(); res.json({ count }); });
-app.post('/api/login', authLimiter, (req, res) => { if (req.body.password === ADMIN_PASSWORD) res.json({ success: true }); else res.status(403).json({ success: false }); });
+app.post('/api/login', authLimiter, requireAuthConfig, (req, res) => {
+    const supplied = asString(req.body.password);
+    if (!ADMIN_PASSWORD) return res.status(503).json({ success: false, error: "ADMIN PASSWORD NOT CONFIGURED" });
+
+    // Constant-time compare: a plain === leaks how many leading characters were right, which is
+    // enough to recover a password one byte at a time. Hashing both sides first keeps the
+    // buffers equal-length, which timingSafeEqual requires.
+    const a = crypto.createHash('sha256').update(supplied).digest();
+    const b = crypto.createHash('sha256').update(ADMIN_PASSWORD).digest();
+    if (!crypto.timingSafeEqual(a, b)) return res.status(403).json({ success: false });
+
+    // The panel gets a scoped, expiring token instead of holding the password in a JS variable
+    const token = jwt.sign({ role: 'admin' }, JWT_SECRET, { expiresIn: '8h' });
+    res.json({ success: true, token });
+});
 
 app.get('/api/drops', async (req, res) => { const all = await PC.find(); res.json(all); });
 app.post('/api/drops', auth, async (req, res) => { const n = new PC(req.body); await n.save(); res.json(n); });
@@ -445,19 +551,54 @@ app.get('/api/check-code/:code', async (req, res) => {
     } catch(e) { console.error(e); res.status(500).json({ valid: false, msg: "SERVER ERROR" }); }
 });
 
-app.post('/api/submit-review', async (req, res) => {
-    const { code, user, rating, text } = req.body;
-    const ticket = await ReviewTicket.findOne({ code });
-    if (!ticket) return res.status(400).json({ error: "Invalid Ticket" });
-    const pc = await PC.findById(ticket.pcId);
-    if (pc) {
-        pc.reviews.push({ user, rating, text, date: new Date() }); await pc.save();
-        ticket.status = 'used'; await ticket.save();
+app.post('/api/submit-review', authLimiter, async (req, res) => {
+    try {
+        const code = asString(req.body.code).trim();
+        const user = asString(req.body.user).trim().slice(0, 40);
+        const text = asString(req.body.text).trim().slice(0, 1000);
+        const rating = Number(req.body.rating);
+
+        if (!code || !user || !text) return res.status(400).json({ error: "All fields required" });
+        if (!Number.isInteger(rating) || rating < 1 || rating > 5) {
+            return res.status(400).json({ error: "Rating must be a whole number from 1 to 5" });
+        }
+
+        const ticket = await ReviewTicket.findOne({ code });
+        if (!ticket) return res.status(400).json({ error: "Invalid Ticket" });
+        // Previously any known code could be replayed to post unlimited reviews
+        if (ticket.status === 'used') return res.status(409).json({ error: "This code has already been redeemed" });
+
+        // Same 48h window /api/check-code enforces — it was checked on read but never on write
+        if (ticket.firstScan) {
+            const expiry = new Date(ticket.firstScan);
+            expiry.setHours(expiry.getHours() + 48);
+            if (new Date() > expiry) return res.status(403).json({ error: "This code has expired" });
+        }
+
+        const pc = await PC.findById(ticket.pcId);
+        if (!pc) return res.status(404).json({ error: "PC not found" });
+
+        pc.reviews.push({ user, rating, text, date: new Date() });
+        await pc.save();
+        ticket.status = 'used';
+        await ticket.save();
         res.json({ success: true });
-    } else { res.status(404).json({ error: "PC not found" }); }
+    } catch (e) {
+        console.error("Submit review failed:", e);
+        res.status(500).json({ error: "Server Error" });
+    }
 });
 
-app.post('/api/newsletter', authLimiter, async (req, res) => { const { email } = req.body; if(!email) return res.status(400).json({error:"Email required"}); const sub = new Newsletter({ email }); await sub.save(); res.json({ success: true }); });
+app.post('/api/newsletter', authLimiter, async (req, res) => {
+    const email = asString(req.body.email).trim().toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254) {
+        return res.status(400).json({ error: "Please enter a valid email address" });
+    }
+    // Don't pile up duplicates every time someone re-submits the form
+    if (await Newsletter.findOne({ email })) return res.json({ success: true });
+    await new Newsletter({ email }).save();
+    res.json({ success: true });
+});
 app.get('/api/newsletter', auth, async (req, res) => { const subs = await Newsletter.find().sort({ date: -1 }); res.json(subs); });
 
 app.listen(PORT, '0.0.0.0', () => { console.log(`🚀 Server running on port ${PORT}`); });
