@@ -224,12 +224,19 @@ const userSchema = new mongoose.Schema({
     username: { type: String, required: true, unique: true },
     email: { type: String, required: true, unique: true },
     password: { type: String, required: true },
-    joined: { type: Date, default: Date.now },
+    // Indexed: sorted by in the admin user list, and counted against by the 'founder' achievement
+    joined: { type: Date, default: Date.now, index: true },
     subscribed: { type: Boolean, default: false },
     resetToken: String,
     resetTokenExpiry: Date,
     wishlist: [{ type: mongoose.Schema.Types.ObjectId, ref: 'PC' }],
     achievements: { type: [String], default: [] },
+    // Durable counters behind the server-verified achievements. They exist because the events
+    // themselves don't survive: a VoteEvent is deleted the moment it expires or is replaced, and
+    // a ReviewTicket is a one-shot code. Without a counter on the account, "you voted" and "you
+    // wrote a report" would silently un-earn themselves the next time the source row disappeared.
+    votesCast: { type: Number, default: 0 },
+    reviewsWritten: { type: Number, default: 0 },
     // Baked into every issued JWT and checked on every authenticated request (see authUser).
     // Bumping this instantly invalidates every token already out there for this account — the
     // only way to kill a stolen session, since the API has no other server-side session store.
@@ -267,15 +274,17 @@ const voteEventSchema = new mongoose.Schema({
 });
 const VoteEvent = mongoose.model('VoteEvent', voteEventSchema);
 
-const reviewTicketSchema = new mongoose.Schema({ 
-    code: String, pcId: String, pcName: String, 
+const reviewTicketSchema = new mongoose.Schema({
+    code: { type: String, index: true }, pcId: String, pcName: String,
     status: { type: String, default: 'pending' }, 
     generatedAt: { type: Date, default: Date.now }, 
     firstScan: { type: Date, default: null } 
 });
 const ReviewTicket = mongoose.model('ReviewTicket', reviewTicketSchema);
 
-const newsletterSchema = new mongoose.Schema({ email: String, date: { type: Date, default: Date.now } });
+// Indexed: the signup route looks up by email to avoid duplicates, and the achievement sync
+// checks it once per unearned "signal_intercepted" — both are exact-match reads on every call.
+const newsletterSchema = new mongoose.Schema({ email: { type: String, index: true }, date: { type: Date, default: Date.now } });
 const Newsletter = mongoose.model('Newsletter', newsletterSchema);
 
 const siteConfigSchema = new mongoose.Schema({
@@ -286,6 +295,127 @@ const siteConfigSchema = new mongoose.Schema({
     proConfigPrice: { type: Number, default: 30 }
 });
 const SiteConfig = mongoose.model('SiteConfig', siteConfigSchema);
+
+// --- 🏅 ACHIEVEMENTS, XP & RANKS ---
+// The previous version took the client at its word: POST /api/achievements accepted any string as
+// an id and stored it, so a single fetch() from devtools granted anything. Ranks are about to be
+// built on top of this, so the split below is the whole point of the rewrite:
+//
+//   source: 'server'  — the API works it out from its own data on every sync. The client cannot
+//                       grant one, and cannot keep one it no longer qualifies for.
+//   source: 'client'  — a UI action the server genuinely cannot observe (a card flip, a wheel
+//                       spin). Still whitelisted by id so nothing can be invented, and worth
+//                       little XP each, so the honest half of the ladder is the one that counts:
+//                       all eight client badges together are worth less than one 'field_report'.
+//
+// XP lives here and nowhere else. The frontend renders whatever /api/me reports, so these numbers
+// can be retuned without shipping a matching frontend change.
+const ACHIEVEMENTS = [
+    // Verified from account state
+    { id: 'recruited',          xp: 25,  source: 'server' },
+    { id: 'identity_confirmed', xp: 75,  source: 'server' },
+    { id: 'first_target',       xp: 25,  source: 'server' },
+    { id: 'collector',          xp: 75,  source: 'server' },
+    { id: 'hoarder',            xp: 150, source: 'server' },
+    { id: 'vote_caster',        xp: 50,  source: 'server' },
+    { id: 'kingmaker',          xp: 150, source: 'server' },
+    { id: 'signal_intercepted', xp: 25,  source: 'server' },
+    { id: 'field_report',       xp: 200, source: 'server' },
+    { id: 'veteran',            xp: 100, source: 'server' },
+    { id: 'founder',            xp: 100, source: 'server' },
+    // Reported by the UI
+    { id: 'first_loot',         xp: 25,  source: 'client' },
+    { id: 'comparator',         xp: 25,  source: 'client' },
+    { id: 'deep_scan',          xp: 25,  source: 'client' },
+    { id: 'benchmarker',        xp: 25,  source: 'client' },
+    { id: 'hacker',             xp: 25,  source: 'client' },
+    { id: 'terminal_access',    xp: 25,  source: 'client' },
+    { id: 'polyglot',           xp: 25,  source: 'client' },
+    { id: 'night_owl',          xp: 25,  source: 'client' }
+];
+
+const ACHIEVEMENT_XP = new Map(ACHIEVEMENTS.map(a => [a.id, a.xp]));
+const CLIENT_ACHIEVEMENT_IDS = new Set(ACHIEVEMENTS.filter(a => a.source === 'client').map(a => a.id));
+
+// Accounts created before this rewrite hold the three original ids. Mapped rather than dropped so
+// nobody loses progress they already earned; anything else unrecognised is discarded on sync.
+const LEGACY_ACHIEVEMENT_IDS = { login: 'recruited', cart: 'first_loot', vote: 'vote_caster' };
+
+// Ascending by minXp — rankFor() walks it backwards, so the order here is what defines the ladder.
+const RANKS = [
+    { id: 'recruit',    minXp: 0 },
+    { id: 'operative',  minXp: 100 },
+    { id: 'fieldAgent', minXp: 250 },
+    { id: 'specialist', minXp: 450 },
+    { id: 'eliteAgent', minXp: 700 },
+    { id: 'phantom',    minXp: 1000 }
+];
+
+function rankFor(xp) {
+    let current = RANKS[0];
+    for (const r of RANKS) if (xp >= r.minXp) current = r;
+    const next = RANKS.find(r => r.minXp > xp) || null;
+    return {
+        rank: current.id,
+        rankMinXp: current.minXp,
+        nextRank: next ? next.id : null,
+        nextRankXp: next ? next.minXp : null,
+        // 0-100, measured across the current band rather than from zero, so the bar fills once per
+        // promotion instead of creeping imperceptibly toward a distant maximum.
+        progress: next
+            ? Math.round(((xp - current.minXp) / (next.minXp - current.minXp)) * 100)
+            : 100
+    };
+}
+
+// Recomputes every server-verified badge from the account's own data, merges in the client-reported
+// ones already banked, and writes back only if something actually changed. Returns the profile the
+// frontend renders. `user` must be a full document (not a .select() projection) — it is saved here.
+async function syncAchievements(user) {
+    const banked = new Set(
+        (user.achievements || [])
+            .map(id => LEGACY_ACHIEVEMENT_IDS[id] || id)
+            .filter(id => ACHIEVEMENT_XP.has(id))
+    );
+
+    const wishlistCount = (user.wishlist || []).length;
+    const earned = new Set(banked);
+
+    // Every account that exists at all has cleared this one
+    earned.add('recruited');
+    if (user.emailVerified) earned.add('identity_confirmed');
+    if (wishlistCount >= 1) earned.add('first_target');
+    if (wishlistCount >= 5) earned.add('collector');
+    if (wishlistCount >= 10) earned.add('hoarder');
+    if ((user.votesCast || 0) >= 1) earned.add('vote_caster');
+    if ((user.votesCast || 0) >= 3) earned.add('kingmaker');
+    if ((user.reviewsWritten || 0) >= 1) earned.add('field_report');
+    if (user.joined && (Date.now() - new Date(user.joined).getTime()) >= 30 * 24 * 60 * 60 * 1000) {
+        earned.add('veteran');
+    }
+
+    // The two that need a query run only while still unearned, so the steady state costs nothing.
+    if (!earned.has('signal_intercepted')) {
+        if (user.subscribed) earned.add('signal_intercepted');
+        else if (await Newsletter.exists({ email: user.email })) earned.add('signal_intercepted');
+    }
+    if (!earned.has('founder')) {
+        const earlier = await User.countDocuments({ joined: { $lt: user.joined } });
+        if (earlier < 100) earned.add('founder');
+    }
+
+    // Stored in registry order so the array is stable between saves and reads predictably in the DB
+    const list = ACHIEVEMENTS.map(a => a.id).filter(id => earned.has(id));
+    const changed = list.length !== (user.achievements || []).length
+        || list.some((id, i) => user.achievements[i] !== id);
+    if (changed) {
+        user.achievements = list;
+        await user.save();
+    }
+
+    const xp = list.reduce((sum, id) => sum + (ACHIEVEMENT_XP.get(id) || 0), 0);
+    return { achievements: list, xp, ...rankFor(xp) };
+}
 
 // --- 📧 EMAIL DELIVERY (Mailjet Send API v3.1) ---
 // Render's free tier blocks outbound SMTP (ports 25/465/587) since Sept 2025, so nodemailer over
@@ -378,6 +508,21 @@ const authUser = async (req, res, next) => {
         next();
     } catch (e) {
         res.status(401).json({ error: "ACCESS DENIED: INVALID OR EXPIRED TOKEN" });
+    }
+};
+
+// For routes that stay open to guests but do more when a session happens to be present (posting a
+// review credits the account it came from, if any). Never a substitute for authUser: it returns
+// null on anything missing or invalid instead of refusing the request.
+const optionalUserId = (req) => {
+    if (!JWT_SECRET) return null;
+    const token = bearerToken(req);
+    if (!token) return null;
+    try {
+        const decoded = jwt.verify(token, JWT_SECRET);
+        return decoded.role === 'admin' ? null : (decoded.id || null);
+    } catch (e) {
+        return null;
     }
 };
 
@@ -597,9 +742,15 @@ app.post('/api/user-login', loginLimiter, requireAuthConfig, async (req, res) =>
 
 app.get('/api/me', authUser, requireVerified, async (req, res) => {
     try {
-        const user = await User.findById(req.userId).populate('wishlist');
+        const user = await User.findById(req.userId);
         if (!user) return res.status(404).json({ error: "User not found" });
-        res.json({ username: user.username, wishlist: user.wishlist, achievements: user.achievements });
+        // Every read is also a re-verification: a badge earned by state the account no longer has
+        // (say a wishlist trimmed back below five) is dropped here rather than lingering forever.
+        // Run before populate so the save inside it writes a plain id array, same as the wishlist
+        // routes do.
+        const profile = await syncAchievements(user);
+        await user.populate('wishlist');
+        res.json({ username: user.username, wishlist: user.wishlist, ...profile });
     } catch (e) { console.error("/api/me failed:", e); res.status(500).json({ error: "Server Error" }); }
 });
 
@@ -611,8 +762,11 @@ app.post('/api/wishlist/:pcId', authUser, requireVerified, async (req, res) => {
             user.wishlist.push(req.params.pcId);
             await user.save();
         }
+        // Three of the badges are wishlist-size thresholds, so the profile has to come back with
+        // the write — otherwise crossing one only shows up after a reload.
+        const profile = await syncAchievements(user);
         await user.populate('wishlist');
-        res.json({ success: true, wishlist: user.wishlist });
+        res.json({ success: true, wishlist: user.wishlist, ...profile });
     } catch (e) { console.error("Wishlist add failed:", e); res.status(500).json({ error: "Server Error" }); }
 });
 
@@ -622,22 +776,34 @@ app.delete('/api/wishlist/:pcId', authUser, requireVerified, async (req, res) =>
         if (!user) return res.status(404).json({ error: "User not found" });
         user.wishlist = user.wishlist.filter(id => id.toString() !== req.params.pcId);
         await user.save();
+        const profile = await syncAchievements(user);
         await user.populate('wishlist');
-        res.json({ success: true, wishlist: user.wishlist });
+        res.json({ success: true, wishlist: user.wishlist, ...profile });
     } catch (e) { console.error("Wishlist remove failed:", e); res.status(500).json({ error: "Server Error" }); }
 });
 
+// Only ever grants a badge the server genuinely cannot observe for itself (a card flip, a wheel
+// spin). Anything outside that whitelist — an unknown id, or the id of a server-verified badge
+// someone is trying to hand themselves — is refused, and the reply is still the real profile, so
+// a client that guesses wrong is simply corrected rather than desynced.
 app.post('/api/achievements', authUser, requireVerified, async (req, res) => {
     try {
-        const { id } = req.body;
+        const id = asString(req.body.id);
         const user = await User.findById(req.userId);
         if (!user) return res.status(404).json({ error: "User not found" });
-        if (id && !user.achievements.includes(id)) {
+
+        if (!CLIENT_ACHIEVEMENT_IDS.has(id)) {
+            const profile = await syncAchievements(user);
+            return res.status(400).json({ error: "UNKNOWN OR NON-REPORTABLE ACHIEVEMENT", ...profile });
+        }
+
+        if (!user.achievements.includes(id)) {
             user.achievements.push(id);
             await user.save();
         }
-        res.json({ success: true, achievements: user.achievements });
-    } catch (e) { res.status(500).json({ error: "Server Error" }); }
+        const profile = await syncAchievements(user);
+        res.json({ success: true, ...profile });
+    } catch (e) { console.error("Achievement save failed:", e); res.status(500).json({ error: "Server Error" }); }
 });
 
 app.post('/api/forgot-password', authLimiter, async (req, res) => {
@@ -837,10 +1003,33 @@ app.post('/api/cast-vote', authUser, requireVerified, async (req, res) => {
             if (now > end) return res.status(403).json({ error: "VOTING HAS CLOSED" });
         }
 
-        event.votedBy.push(req.userId);
-        event.currentVotes += 1;
-        await event.save();
-        res.json({ votes: event.currentVotes, hasVoted: true });
+        // Read-modify-write on the document lost votes under concurrency: two requests landing
+        // together both read the same currentVotes and the second save overwrote the first. One
+        // atomic update instead, with "hasn't voted yet" as part of the match — so the database,
+        // not a prior read, is what enforces one-vote-per-account.
+        const updated = await VoteEvent.findOneAndUpdate(
+            { _id: event._id, votedBy: { $ne: req.userId } },
+            { $addToSet: { votedBy: req.userId }, $inc: { currentVotes: 1 } },
+            { new: true }
+        );
+        if (!updated) {
+            // Matched nothing: this account's vote was already recorded between the check above
+            // and here (double-click, two tabs). Report the current count rather than a failure.
+            const fresh = await VoteEvent.findById(event._id).select('currentVotes');
+            return res.status(409).json({ error: "ALREADY VOTED", votes: fresh?.currentVotes ?? event.currentVotes, hasVoted: true });
+        }
+
+        // Counted on the account as well as the event, because the event is deleted when it
+        // expires — see the votesCast comment on userSchema.
+        const user = await User.findById(req.userId);
+        let profile = null;
+        if (user) {
+            user.votesCast = (user.votesCast || 0) + 1;
+            await user.save();
+            profile = await syncAchievements(user);
+        }
+
+        res.json({ votes: updated.currentVotes, hasVoted: true, profile });
     } catch (e) {
         console.error("Cast vote failed:", e);
         res.status(500).json({ error: "Server Error" });
@@ -931,6 +1120,17 @@ app.post('/api/submit-review', authLimiter, async (req, res) => {
         await pc.save();
         ticket.status = 'used';
         await ticket.save();
+
+        // The route stays open to guests — a mission code is the proof of purchase, not a login —
+        // but when the browser does have a session, credit the account so 'field_report' becomes
+        // earnable. The ticket is already marked used above, so this can't be farmed.
+        const reviewerId = optionalUserId(req);
+        if (reviewerId) {
+            try {
+                await User.updateOne({ _id: reviewerId }, { $inc: { reviewsWritten: 1 } });
+            } catch (e) { console.error("Crediting review to account failed:", e); }
+        }
+
         res.json({ success: true });
     } catch (e) {
         console.error("Submit review failed:", e);
