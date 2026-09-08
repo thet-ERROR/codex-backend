@@ -261,7 +261,24 @@ const userSchema = new mongoose.Schema({
     // meant "one vote per email you were willing to type," which costs nothing to fake.
     emailVerified: { type: Boolean, default: false },
     emailVerifyTokenHash: String,
-    emailVerifyExpiry: Date
+    emailVerifyExpiry: Date,
+    // Throttles /api/resend-verification independently of the shared authLimiter — that limiter is
+    // 100 requests per 15 minutes across every auth route, loose enough that one impatient click of
+    // "resend" ten times in a row would still queue ten emails before it ever engaged.
+    lastVerificationEmailSentAt: Date,
+    // The "wasn't you?" escape hatch mailed alongside every verification link. Deliberately a
+    // SEPARATE token from emailVerifyTokenHash, on its own 7-day clock: the verify link is short-
+    // lived by design, but whoever registered with a stranger's address holds the only password —
+    // the real owner has no way to ask for a fresh email if they're late, so this one has to
+    // outlive a single 24h window. Cleared the moment the account is legitimately verified (see
+    // /api/verify-email) so a genuine owner can never lock themselves out by clicking a stale link
+    // dug up from an old email.
+    securityReportTokenHash: String,
+    securityReportTokenExpiry: Date,
+    // Set by /api/report-unauthorized-signup. Checked at login (after the password matches, so a
+    // brute-force attempt without the real password never learns an account is in this state) and
+    // enforced immediately on any live session via the tokenVersion bump that accompanies it.
+    securityLockedUntil: Date
 });
 const User = mongoose.model('User', userSchema);
 
@@ -447,9 +464,11 @@ if (!EMAIL_FROM) {
     console.error("🚨 EMAIL_FROM is not set — set it to the sender address you validated in Mailjet.");
 }
 
-// Same call shape nodemailer used ({ to, subject, text }) so every existing call site is
-// unchanged. Throws on failure; callers already log and carry on without failing the request.
-async function sendMail({ to, subject, text }) {
+// `html` is optional — every existing call site (forgot-password, reset-password) keeps sending
+// text-only exactly as before. TextPart is still sent alongside HTMLPart even when html is given:
+// Mailjet's spam scoring and any client that can't render HTML both fall back to it.
+// Throws on failure; callers already log and carry on without failing the request.
+async function sendMail({ to, subject, text, html }) {
     if (!MAILJET_API_KEY || !MAILJET_SECRET_KEY || !EMAIL_FROM) {
         throw new Error('Email is not configured (MAILJET_API_KEY / MAILJET_SECRET_KEY / EMAIL_FROM missing)');
     }
@@ -468,7 +487,8 @@ async function sendMail({ to, subject, text }) {
                 From: { Email: EMAIL_FROM, Name: EMAIL_FROM_NAME },
                 To: [{ Email: to }],
                 Subject: subject,
-                TextPart: text
+                TextPart: text,
+                ...(html ? { HTMLPart: html } : {})
             }]
         })
     });
@@ -558,17 +578,66 @@ function issueEmailVerification(user) {
     return rawToken;
 }
 
-async function sendVerificationEmail(user, rawToken) {
+// The "wasn't you?" token. Re-issued (rotated) alongside the verify token on every send, same as
+// issueEmailVerification — but on its own 7-day clock rather than 24h. See the schema comment on
+// securityReportTokenHash for why the two can't share a lifetime.
+function issueSecurityReportToken(user) {
+    const rawToken = crypto.randomBytes(32).toString('hex');
+    user.securityReportTokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
+    user.securityReportTokenExpiry = Date.now() + 7 * 24 * 60 * 60 * 1000; // 7 days
+    return rawToken;
+}
+
+// Minimal HTML-escaping for the one piece of user data that reaches the email template. The
+// username is already restricted to [a-zA-Z0-9_.-] at registration so this can never actually
+// fire — kept anyway because "the input is validated elsewhere" is exactly the assumption that
+// broke on the admin panel (see the newsletter-email XSS fix), and an email template is not a
+// context worth trusting twice.
+const escHtml = (v) => String(v ?? '').replace(/[&<>"']/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
+
+// Table-based layout with every style inline: Outlook's rendering engine is Word, not a browser,
+// and most clients strip <style> blocks outright, so anything depending on external CSS or flex/
+// grid silently collapses. This is the plainest layout that still looks like a real product email
+// rather than the raw-URL plaintext it replaces.
+function buildVerificationEmailHtml({ username, confirmLink, reportLink }) {
+    const font = "font-family:Arial,Helvetica,sans-serif;";
+    return `
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#0a0a0a;padding:32px 16px;">
+<tr><td align="center">
+<table role="presentation" width="480" cellpadding="0" cellspacing="0" style="max-width:480px;background:#141414;border:1px solid #262626;border-radius:12px;">
+<tr><td style="padding:32px 32px 8px 32px;text-align:center;">
+<span style="${font}font-size:12px;letter-spacing:3px;color:#ccff00;font-weight:bold;">PHOENIX CODEX</span>
+</td></tr>
+<tr><td style="padding:8px 32px 24px 32px;text-align:center;">
+<div style="${font}font-size:20px;color:#ffffff;font-weight:bold;margin-bottom:12px;">Confirm your identity, Agent ${escHtml(username)}</div>
+<div style="${font}font-size:14px;color:#999999;line-height:1.6;">One more step unlocks your dossier, wishlist and voting rights. This link is valid for 24 hours.</div>
+</td></tr>
+<tr><td style="padding:8px 32px 32px 32px;text-align:center;">
+<a href="${confirmLink}" style="display:inline-block;background:#ccff00;color:#0a0a0a;${font}font-size:14px;font-weight:bold;text-decoration:none;padding:14px 32px;border-radius:8px;">CONFIRM MY EMAIL</a>
+</td></tr>
+<tr><td style="padding:20px 32px 32px 32px;border-top:1px solid #262626;">
+<div style="${font}font-size:12px;color:#666666;line-height:1.6;text-align:center;">Didn't create this account? <a href="${reportLink}" style="color:#ff6666;">Secure it now</a> — this locks it for 5 days.</div>
+</td></tr>
+</table>
+<div style="${font}font-size:11px;color:#444444;margin-top:16px;">CODEX HQ</div>
+</td></tr>
+</table>`.trim();
+}
+
+async function sendVerificationEmail(user, rawVerifyToken, rawReportToken) {
     // Points at the frontend, not the API — verification is done by that page's own POST call
     // once it loads (js/main.js), never by whatever GETs the link itself (a mail client's link
     // scanner never runs the page's JavaScript). Falls back to the API URL only if no frontend
-    // origin is configured, so verification is never completely undeliverable.
+    // origin is configured, so verification is never completely undeliverable. The report link
+    // uses the identical reasoning and the identical protection.
     const base = ALLOWED_ORIGINS[0] || `https://codex-backend-9kij.onrender.com`;
-    const link = `${base}/?verify=${rawToken}`;
+    const confirmLink = `${base}/?verify=${rawVerifyToken}`;
+    const reportLink = `${base}/?report=${rawReportToken}`;
     await sendMail({
         to: user.email,
         subject: '✅ CONFIRM YOUR AGENT IDENTITY',
-        text: `AGENT ${user.username},\n\nConfirm your email to unlock your dossier, wishlist and voting rights:\n${link}\n\nThis link is valid for 24 hours.\n- CODEX HQ`
+        text: `AGENT ${user.username},\n\nConfirm your email to unlock your dossier, wishlist and voting rights:\n${confirmLink}\n\nThis link is valid for 24 hours.\n\nDidn't create this account? Secure it now (locks it for 5 days):\n${reportLink}\n\n- CODEX HQ`,
+        html: buildVerificationEmailHtml({ username: user.username, confirmLink, reportLink })
     });
 }
 
@@ -677,6 +746,8 @@ app.post('/api/register', authLimiter, requireAuthConfig, async (req, res) => {
         const hashedPassword = await bcrypt.hash(password, salt);
         const newUser = new User({ username, email, password: hashedPassword, subscribed });
         const rawVerifyToken = issueEmailVerification(newUser);
+        const rawReportToken = issueSecurityReportToken(newUser);
+        newUser.lastVerificationEmailSentAt = new Date();
         await newUser.save();
         if (subscribed) {
             try { await new Newsletter({ email }).save(); } catch (e) { console.error("Newsletter subscribe failed:", e); }
@@ -686,7 +757,7 @@ app.post('/api/register', authLimiter, requireAuthConfig, async (req, res) => {
         // side that looked exactly like clicking Register "did nothing", even though the account
         // was already saved above. The account still exists and can request a fresh link via
         // /api/resend-verification, so a slow or failed send here must never hold up the reply.
-        sendVerificationEmail(newUser, rawVerifyToken).catch(e => console.error("Verification email send failed:", e));
+        sendVerificationEmail(newUser, rawVerifyToken, rawReportToken).catch(e => console.error("Verification email send failed:", e));
 
         const token = jwt.sign({ id: newUser._id, username: newUser.username, tokenVersion: newUser.tokenVersion }, JWT_SECRET, { expiresIn: '30d' });
         res.json({ success: true, username: newUser.username, token, emailVerified: false });
@@ -706,6 +777,11 @@ app.post('/api/verify-email', authLimiter, async (req, res) => {
         user.emailVerified = true;
         user.emailVerifyTokenHash = undefined;
         user.emailVerifyExpiry = undefined;
+        // This IS the account owner completing signup — the "wasn't you?" link from this same
+        // email (and any earlier resend) stops working the moment that's proven, so a genuine
+        // owner can never dig up an old email later and lock themselves out by clicking it.
+        user.securityReportTokenHash = undefined;
+        user.securityReportTokenExpiry = undefined;
         await user.save();
         res.json({ success: true });
     } catch (e) { console.error("Verify email failed:", e); res.status(500).json({ success: false, error: "Server Error" }); }
@@ -714,17 +790,65 @@ app.post('/api/verify-email', authLimiter, async (req, res) => {
 // Requires a valid session but deliberately NOT requireVerified — this is the one way out of the
 // unverified state, so gating it behind the same gate would be a dead end for anyone whose first
 // email never arrived.
+const RESEND_VERIFICATION_COOLDOWN_MS = 60 * 1000;
+
 app.post('/api/resend-verification', authLimiter, authUser, async (req, res) => {
     try {
         const user = await User.findById(req.userId);
         if (!user) return res.status(404).json({ error: "User not found" });
         if (user.emailVerified) return res.json({ success: true, alreadyVerified: true });
+
+        // Separate from authLimiter (100 requests/15min, shared across every auth route — loose
+        // enough that mashing this button ten times would queue ten emails before it ever
+        // engaged). retryAfterMs lets the frontend show a live countdown instead of a flat "wait".
+        const elapsed = user.lastVerificationEmailSentAt ? Date.now() - user.lastVerificationEmailSentAt.getTime() : Infinity;
+        if (elapsed < RESEND_VERIFICATION_COOLDOWN_MS) {
+            return res.status(429).json({
+                error: "Please wait before requesting another verification email",
+                retryAfterMs: RESEND_VERIFICATION_COOLDOWN_MS - elapsed
+            });
+        }
+
         const rawVerifyToken = issueEmailVerification(user);
+        const rawReportToken = issueSecurityReportToken(user);
+        user.lastVerificationEmailSentAt = new Date();
         await user.save();
         // Same reasoning as /api/register — don't let a slow mail server hold up the response.
-        sendVerificationEmail(user, rawVerifyToken).catch(e => console.error("Resend verification email send failed:", e));
+        sendVerificationEmail(user, rawVerifyToken, rawReportToken).catch(e => console.error("Resend verification email send failed:", e));
         res.json({ success: true });
     } catch (e) { console.error("Resend verification failed:", e); res.status(500).json({ error: "Server Error" }); }
+});
+
+// Public — the raw token IS the proof, same shape as /api/verify-email. Deliberately NOT
+// single-use: the real owner may open several old copies of this email over the following days,
+// and each click should just reconfirm the lock rather than fail on the second attempt.
+app.post('/api/report-unauthorized-signup', authLimiter, async (req, res) => {
+    try {
+        const token = asString(req.body.token).trim();
+        if (!token) return res.status(400).json({ success: false, error: "Missing token" });
+        const hashed = crypto.createHash('sha256').update(token).digest('hex');
+        const user = await User.findOne({ securityReportTokenHash: hashed, securityReportTokenExpiry: { $gt: Date.now() } });
+        if (!user) return res.status(400).json({ success: false, error: "Invalid or expired security link" });
+
+        // The token survives verification's undefined-ing race only if verification happened in
+        // the same instant — in practice this means someone reporting their OWN, already-confirmed
+        // account from a stale email. Treat that as inert rather than locking a legitimate owner
+        // out of their own account.
+        if (user.emailVerified) {
+            return res.json({ success: true, alreadyVerified: true });
+        }
+
+        user.securityLockedUntil = new Date(Date.now() + 5 * 24 * 60 * 60 * 1000);
+        // Whoever registered can no longer complete verification with the link already mailed to
+        // the real owner's inbox...
+        user.emailVerifyTokenHash = undefined;
+        user.emailVerifyExpiry = undefined;
+        // ...and if they're already mid-session, tokenVersion is what the existing authUser check
+        // enforces — this kills that session on its very next request, not just future logins.
+        user.tokenVersion = (user.tokenVersion || 0) + 1;
+        await user.save();
+        res.json({ success: true, lockedUntil: user.securityLockedUntil });
+    } catch (e) { console.error("Report unauthorized signup failed:", e); res.status(500).json({ success: false, error: "Server Error" }); }
 });
 
 app.post('/api/user-login', loginLimiter, requireAuthConfig, async (req, res) => {
@@ -745,6 +869,16 @@ app.post('/api/user-login', loginLimiter, requireAuthConfig, async (req, res) =>
         if (!user) { recordFailedLogin(lockKey); return res.status(400).json({ error: "Invalid Credentials" }); }
         const isMatch = await bcrypt.compare(password, user.password);
         if (isMatch) {
+            // Checked only AFTER the password matches, deliberately: revealing "this account is
+            // locked" to someone who doesn't actually hold the password would let a brute-force
+            // attempt confirm a username is real and reported, without proving anything else.
+            if (user.securityLockedUntil && user.securityLockedUntil > new Date()) {
+                const hoursLeft = Math.ceil((user.securityLockedUntil - new Date()) / (60 * 60 * 1000));
+                return res.status(403).json({
+                    error: `This account was reported as unauthorized and is locked for ${hoursLeft} more hour(s).`,
+                    code: "ACCOUNT_LOCKED"
+                });
+            }
             clearFailedLogins(lockKey);
             const token = jwt.sign({ id: user._id, username: user.username, tokenVersion: user.tokenVersion }, JWT_SECRET, { expiresIn: '30d' });
             res.json({ success: true, username: user.username, token, emailVerified: user.emailVerified });
@@ -879,7 +1013,7 @@ app.get('/api/users/count', auth, async (req, res) => { const count = await User
 app.get('/api/users', auth, async (req, res) => {
     try {
         const users = await User.find()
-            .select('username email joined subscribed emailVerified wishlist achievements')
+            .select('username email joined subscribed emailVerified wishlist achievements securityLockedUntil')
             .sort({ joined: -1 })
             .limit(500); // demo-scale cap — swap for real pagination if the user base grows
         res.json(users);
