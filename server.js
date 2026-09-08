@@ -322,7 +322,22 @@ const siteConfigSchema = new mongoose.Schema({
     maintenanceMessage: { type: String, default: "PHOENIX CODEX is currently undergoing scheduled maintenance. We'll be back online shortly." },
     // Pro Config is the same service on every build, so its price lives here rather than per-PC.
     // Exposed publicly through /api/status (the frontend needs it to price the option).
-    proConfigPrice: { type: Number, default: 30 }
+    proConfigPrice: { type: Number, default: 30 },
+    // The "?" button on the vote card explaining how community drops work. Lives here rather than
+    // on VoteEvent because VoteEvent is deleted and recreated wholesale every time an event starts
+    // (see POST /api/vote-event) — the admin would have to retype this explainer for every single
+    // drop otherwise. Split EN/EL to match every other piece of admin-authored prose in this schema
+    // (PC.lore/loreEl, VoteEvent.lore/loreEl) rather than being the one exception. Rendered with the
+    // browser's own line-break handling (see .vote-info-text in vote.css), not as HTML, so no
+    // escaping is needed and no markup can be injected through it.
+    voteInfoText: {
+        type: String,
+        default: "Vote is a community system: the network votes on which mystery PC gets unlocked for purchase.\n\n1. Voting opens at the specified date.\n2. Reach target votes to unlock drops.\n3. Only signed-in, verified agents can vote.\n4. If the system isn't secured before the timer runs out, it automatically moves to Live Drops."
+    },
+    voteInfoTextEl: {
+        type: String,
+        default: "Το Vote είναι ένα κοινοτικό σύστημα: η ομάδα ψηφίζει ποιο μυστηριώδες PC θα ξεκλειδωθεί για αγορά.\n\n1. Η ψηφοφορία ανοίγει στην καθορισμένη ημερομηνία.\n2. Συγκεντρώστε τις απαιτούμενες ψήφους για να ξεκλειδώσει το drop.\n3. Μόνο συνδεδεμένοι, επιβεβαιωμένοι πράκτορες μπορούν να ψηφίσουν.\n4. Αν το σύστημα δεν εξασφαλιστεί πριν λήξει το χρονόμετρο, μεταφέρεται αυτόματα στα Live Drops."
+    }
 });
 const SiteConfig = mongoose.model('SiteConfig', siteConfigSchema);
 
@@ -675,6 +690,12 @@ app.get('/api/status', async (req, res) => {
         message: config?.maintenanceMessage || null,
         // Public on purpose: the storefront prices the Pro Config extra from this.
         proConfigPrice: config?.proConfigPrice ?? 30,
+        // Public on purpose too: the vote card's "?" button reads these straight from state. Fall
+        // back to the schema defaults (duplicated here, same as proConfigPrice above) because this
+        // route never creates a SiteConfig document — only the admin GET does, on first visit —
+        // so a site where the admin panel has never been opened must still show sensible copy.
+        voteInfoText: config?.voteInfoText || "Vote is a community system: the network votes on which mystery PC gets unlocked for purchase.\n\n1. Voting opens at the specified date.\n2. Reach target votes to unlock drops.\n3. Only signed-in, verified agents can vote.\n4. If the system isn't secured before the timer runs out, it automatically moves to Live Drops.",
+        voteInfoTextEl: config?.voteInfoTextEl || "Το Vote είναι ένα κοινοτικό σύστημα: η ομάδα ψηφίζει ποιο μυστηριώδες PC θα ξεκλειδωθεί για αγορά.\n\n1. Η ψηφοφορία ανοίγει στην καθορισμένη ημερομηνία.\n2. Συγκεντρώστε τις απαιτούμενες ψήφους για να ξεκλειδώσει το drop.\n3. Μόνο συνδεδεμένοι, επιβεβαιωμένοι πράκτορες μπορούν να ψηφίσουν.\n4. Αν το σύστημα δεν εξασφαλιστεί πριν λήξει το χρονόμετρο, μεταφέρεται αυτόματα στα Live Drops.",
         // Diagnostics. Says whether the allowlist is configured at all and whether THIS caller's
         // origin is on it — the caller already knows its own origin, so nothing leaks, and a
         // silent CORS refusal becomes a one-request check instead of a log hunt.
@@ -701,13 +722,21 @@ app.get('/api/site-config', auth, async (req, res) => {
 
 app.post('/api/site-config', auth, async (req, res) => {
     try {
-        const { maintenanceMode, maintenanceMessage, proConfigPrice } = req.body;
+        const { maintenanceMode, maintenanceMessage, proConfigPrice, voteInfoText, voteInfoTextEl } = req.body;
         let config = await SiteConfig.findOne();
         if (!config) config = new SiteConfig();
         if (typeof maintenanceMode === 'boolean') config.maintenanceMode = maintenanceMode;
         if (typeof maintenanceMessage === 'string') config.maintenanceMessage = maintenanceMessage;
         if (proConfigPrice !== undefined && !Number.isNaN(Number(proConfigPrice))) {
             config.proConfigPrice = Math.max(0, Number(proConfigPrice));
+        }
+        // Capped well above anything a real explainer needs — this is admin-only input, but the
+        // cap still guards against a stray paste turning the modal into an unreadable wall.
+        if (typeof voteInfoText === 'string' && voteInfoText.length <= 2000) {
+            config.voteInfoText = voteInfoText;
+        }
+        if (typeof voteInfoTextEl === 'string' && voteInfoTextEl.length <= 2000) {
+            config.voteInfoTextEl = voteInfoTextEl;
         }
         await config.save();
         res.json({ success: true, config });
