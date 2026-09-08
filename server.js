@@ -153,6 +153,19 @@ const requireAuthConfig = (req, res, next) => {
 const asString = v => (typeof v === 'string' ? v : '');
 
 // --- EMAIL ADDRESS SANITY CHECKS ---
+// The previous pattern was /^[^\s@]+@[^\s@]+\.[^\s@]+$/ — "anything without spaces, with an @".
+// That accepts "<svg/onload=fetch(...)>@gmail.com": it has no space, exactly one @, and the domain
+// half is a real domain, so it also passed the MX check below. The address was then stored and
+// rendered by the admin panel, which is how a public, unauthenticated signup form became a way to
+// run script in an authenticated admin's browser.
+//
+// This pattern allows only characters that appear in addresses people actually use, which happens
+// to exclude every HTML metacharacter (< > " ' / & =). RFC 5321 technically permits more in the
+// local part, but no mainstream provider issues such addresses, and letting them through here is
+// how the injection above became possible in the first place.
+const EMAIL_PATTERN = /^[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}$/;
+const isValidEmail = (email) => email.length <= 254 && EMAIL_PATTERN.test(email);
+
 // A format regex alone accepts anything shaped like an address, so "asdf@asdf.com" sails through.
 // These two checks raise the bar cheaply; the verification link remains the real proof of
 // ownership, since only a mailbox that actually receives it can complete signup.
@@ -642,7 +655,7 @@ app.post('/api/register', authLimiter, requireAuthConfig, async (req, res) => {
         if (username.length < 3 || username.length > 24 || !/^[a-zA-Z0-9_.-]+$/.test(username)) {
             return res.status(400).json({ error: "Username must be 3-24 characters (letters, numbers, . _ - only)" });
         }
-        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254) {
+        if (!isValidEmail(email)) {
             return res.status(400).json({ error: "Please enter a valid email address" });
         }
         if (isDisposableEmail(email)) {
@@ -1097,6 +1110,15 @@ app.post('/api/submit-review', authLimiter, async (req, res) => {
         const rating = Number(req.body.rating);
 
         if (!code || !user || !text) return res.status(400).json({ error: "All fields required" });
+
+        // The display name is shown in the admin panel and on the storefront. Both escape it, so
+        // this is the second layer — it keeps the value safe for any future consumer that is not an
+        // escaped HTML template (a CSV export, an email body). Only the NAME is restricted: review
+        // text legitimately contains angle brackets in this shop ("temps <70°C"), and accented and
+        // Greek letters stay allowed in both.
+        if (/[<>]/.test(user)) {
+            return res.status(400).json({ error: "Name cannot contain < or > characters" });
+        }
         if (!Number.isInteger(rating) || rating < 1 || rating > 5) {
             return res.status(400).json({ error: "Rating must be a whole number from 1 to 5" });
         }
@@ -1140,7 +1162,9 @@ app.post('/api/submit-review', authLimiter, async (req, res) => {
 
 app.post('/api/newsletter', authLimiter, async (req, res) => {
     const email = asString(req.body.email).trim().toLowerCase();
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254) {
+    // This route takes no authentication at all, so it is the widest opening on the API — and its
+    // output is read back by the admin panel. Validate it exactly as strictly as registration.
+    if (!isValidEmail(email)) {
         return res.status(400).json({ error: "Please enter a valid email address" });
     }
     // Don't pile up duplicates every time someone re-submits the form
