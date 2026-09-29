@@ -1093,10 +1093,49 @@ app.put('/api/drops/:id', auth, async (req, res) => {
         // findByIdAndUpdate throws a CastError on a malformed :id (not a valid ObjectId) — was
         // uncaught here, which without this try/catch depends on the global error handler below
         // (and, before that existed, could surface a raw stack trace instead of a clean 400).
-        const u = await PC.findByIdAndUpdate(req.params.id, req.body, { new: true, runValidators: true });
+        //
+        // `reviews` is stripped: the panel loads a PC's reviews when EDIT is clicked and used to send
+        // that whole array back on save, so any customer review posted in between was silently
+        // overwritten by the admin's stale copy. Reviews on an existing PC are only ever changed
+        // through the dedicated add/remove routes below, which touch one entry at a time.
+        const { reviews, ...update } = req.body || {};
+        const u = await PC.findByIdAndUpdate(req.params.id, update, { new: true, runValidators: true });
         if (!u) return res.status(404).json({ error: "PC not found" });
         res.json(u);
     } catch (e) { console.error("Update drop failed:", e); res.status(400).json({ error: "Invalid system data or id" }); }
+});
+
+// Manual reviews added from the admin panel. One entry per call via $push / $pull, so an admin
+// edit and a customer's review landing at the same moment can no longer overwrite each other.
+app.post('/api/drops/:id/reviews', auth, async (req, res) => {
+    try {
+        const user = asString(req.body.user).trim().slice(0, 40);
+        const text = asString(req.body.text).trim().slice(0, 1000);
+        const rating = Number(req.body.rating);
+        if (!user || !text) return res.status(400).json({ error: "User and text required" });
+        if (!Number.isInteger(rating) || rating < 1 || rating > 5) {
+            return res.status(400).json({ error: "Rating must be a whole number from 1 to 5" });
+        }
+        const u = await PC.findByIdAndUpdate(
+            req.params.id,
+            { $push: { reviews: { user, text, rating, date: new Date() } } },
+            { new: true }
+        );
+        if (!u) return res.status(404).json({ error: "PC not found" });
+        res.json({ success: true, reviews: u.reviews });
+    } catch (e) { console.error("Add review failed:", e); res.status(400).json({ error: "Invalid id" }); }
+});
+
+app.delete('/api/drops/:id/reviews/:reviewId', auth, async (req, res) => {
+    try {
+        const u = await PC.findByIdAndUpdate(
+            req.params.id,
+            { $pull: { reviews: { _id: req.params.reviewId } } },
+            { new: true }
+        );
+        if (!u) return res.status(404).json({ error: "PC not found" });
+        res.json({ success: true, reviews: u.reviews });
+    } catch (e) { console.error("Remove review failed:", e); res.status(400).json({ error: "Invalid id" }); }
 });
 app.delete('/api/drops/:id', auth, async (req, res) => {
     try {
@@ -1298,13 +1337,29 @@ app.post('/api/submit-review', authLimiter, async (req, res) => {
             if (new Date() > expiry) return res.status(403).json({ error: "This code has expired" });
         }
 
-        const pc = await PC.findById(ticket.pcId);
-        if (!pc) return res.status(404).json({ error: "PC not found" });
+        if (!await PC.exists({ _id: ticket.pcId })) return res.status(404).json({ error: "PC not found" });
 
-        pc.reviews.push({ user, rating, text, date: new Date() });
-        await pc.save();
-        ticket.status = 'used';
-        await ticket.save();
+        // Claim the ticket atomically BEFORE writing the review. The old order was read status ->
+        // push review -> mark used, so two submits with the same code landing together (a double
+        // tap, a retried request) both passed the `status === 'used'` check above and both posted.
+        // Putting "not yet used" in the match means only one request can ever flip it.
+        const claimed = await ReviewTicket.findOneAndUpdate(
+            { _id: ticket._id, status: { $ne: 'used' } },
+            { $set: { status: 'used' } }
+        );
+        if (!claimed) return res.status(409).json({ error: "This code has already been redeemed" });
+
+        // $push rather than load-modify-save of the whole PC document: a concurrent admin edit of
+        // this same PC then can't be overwritten by this write, or vice versa.
+        const pushed = await PC.updateOne(
+            { _id: ticket.pcId },
+            { $push: { reviews: { user, rating, text, date: new Date() } } }
+        );
+        if (!pushed.matchedCount) {
+            // The PC was deleted between the check above and here — give the customer their code back
+            await ReviewTicket.updateOne({ _id: ticket._id }, { $set: { status: ticket.status } });
+            return res.status(404).json({ error: "PC not found" });
+        }
 
         // The route stays open to guests — a mission code is the proof of purchase, not a login —
         // but when the browser does have a session, credit the account so 'field_report' becomes
