@@ -196,12 +196,20 @@ async function domainAcceptsMail(email) {
 
 console.log("⏳ Connecting to MongoDB...");
 mongoose.connect(dbURI, { serverSelectionTimeoutMS: 30000, socketTimeoutMS: 45000 })
-.then(() => console.log("✅ SERVER ONLINE: DATABASE CONNECTED (SECURE MODE)"))
+.then(() => {
+    console.log("✅ SERVER ONLINE: DATABASE CONNECTED (SECURE MODE)");
+    migrateLegacyPrices(); // declared below the models; runs once the connection is up
+})
 .catch((err) => console.error("❌ DB CONNECTION ERROR:", err.message));
 
 // --- SCHEMAS ---
 const pcSchema = new mongoose.Schema({
-    name: String, price: String, description: String, lore: String, loreEl: String, stock: { type: Number, default: 1 },
+    // priceCents is the source of truth (integer euro cents — no float rounding, no parsing a
+    // free-text "€1.200" to do arithmetic). `price` is the legacy free-text field: kept rather than
+    // dropped so nothing already in the database is lost, and mirrored from priceCents on every
+    // write so a browser still running the old frontend mid-deploy doesn't break. See
+    // normalizePriceFields() and migrateLegacyPrices().
+    name: String, price: String, priceCents: { type: Number, min: 0 }, description: String, lore: String, loreEl: String, stock: { type: Number, default: 1 },
     images: [String], status: { type: String, default: 'available' }, category: { type: String, default: 'drop' },    
     multitasking: { type: Number, default: 0 },
     specs: { cpu: String, gpu: String, ram: String, ssd: String, mobo: String, psu: String, case: String },
@@ -293,6 +301,7 @@ const voteEventSchema = new mongoose.Schema({
     startDate: Date,
     durationDays: Number,
     price: String,
+    priceCents: { type: Number, min: 0 }, // same arrangement as pcSchema — see the comment there
     specs: { cpu: String, gpu: String, ram: String, ssd: String, mobo: String, psu: String, case: String },
     // Mirrors the PC fields so the vote drop can open in the same inspect card as every other
     // build (flip to specs, show FPS, lore on the front).
@@ -340,6 +349,66 @@ const siteConfigSchema = new mongoose.Schema({
     }
 });
 const SiteConfig = mongoose.model('SiteConfig', siteConfigSchema);
+
+// --- 💶 PRICES ---
+// Reads the free-text prices the admin panel used to store ("340", "€340", "1.200", "449,99€").
+// The last separator is a decimal point only when one or two digits follow it; three digits means
+// a thousands separator. Returns integer cents, or null when there's no number in there at all.
+function parseLegacyPriceToCents(value) {
+    if (typeof value === 'number') return Number.isFinite(value) && value >= 0 ? Math.round(value * 100) : null;
+    const s = String(value ?? '').replace(/[^\d.,]/g, '');
+    if (!/\d/.test(s)) return null;
+    const lastSep = Math.max(s.lastIndexOf('.'), s.lastIndexOf(','));
+    let whole = s, frac = '';
+    if (lastSep !== -1) {
+        const after = s.slice(lastSep + 1);
+        if (after.length === 1 || after.length === 2) { whole = s.slice(0, lastSep); frac = after; }
+    }
+    const cents = parseInt(whole.replace(/[.,]/g, '') || '0', 10) * 100 + (frac ? parseInt(frac.padEnd(2, '0'), 10) : 0);
+    return Number.isFinite(cents) ? cents : null;
+}
+
+// Applied to every admin write of a PC or vote event. priceCents wins; a body that only has the
+// old `price` (a stale admin tab from before this change) is converted instead of rejected. Either
+// way `price` is rewritten as a whole-euro mirror for any old frontend still reading it — whole
+// euros because that code strips every non-digit, so "449.99" would have read as 44999.
+function normalizePriceFields(body) {
+    if (!body || typeof body !== 'object') return body;
+    let cents = null;
+    if (body.priceCents !== undefined && body.priceCents !== null && body.priceCents !== '') {
+        const n = Number(body.priceCents);
+        cents = Number.isInteger(n) && n >= 0 ? n : null;
+        if (cents === null) throw new Error('priceCents must be a non-negative integer');
+    } else if (body.price !== undefined) {
+        cents = parseLegacyPriceToCents(body.price);
+    }
+    if (cents !== null) {
+        body.priceCents = cents;
+        body.price = String(Math.round(cents / 100));
+    }
+    return body;
+}
+
+// One-time backfill, safe to run on every boot: only touches documents that still have no
+// priceCents, and only ever adds a field — the original `price` text is left as it was.
+async function migrateLegacyPrices() {
+    for (const Model of [PC, VoteEvent]) {
+        try {
+            const docs = await Model.find({ priceCents: { $exists: false } }).select('price');
+            let migrated = 0;
+            for (const doc of docs) {
+                const cents = parseLegacyPriceToCents(doc.price);
+                if (cents === null) {
+                    console.warn(`⚠️ ${Model.modelName} ${doc._id}: price "${doc.price}" has no number in it — left for the admin to fix`);
+                    continue;
+                }
+                await Model.updateOne({ _id: doc._id }, { $set: { priceCents: cents } });
+                migrated++;
+            }
+            if (migrated) console.log(`💶 Migrated ${migrated} ${Model.modelName} price(s) to priceCents`);
+        } catch (e) { console.error(`Price migration for ${Model.modelName} failed:`, e); }
+    }
+}
 
 // --- 🏅 ACHIEVEMENTS, XP & RANKS ---
 // The previous version took the client at its word: POST /api/achievements accepted any string as
@@ -1085,7 +1154,7 @@ app.get('/api/drops', async (req, res) => {
     catch (e) { console.error("Fetch drops failed:", e); res.status(500).json({ error: "Server Error" }); }
 });
 app.post('/api/drops', auth, async (req, res) => {
-    try { const n = new PC(req.body); await n.save(); res.json(n); }
+    try { const n = new PC(normalizePriceFields(req.body)); await n.save(); res.json(n); }
     catch (e) { console.error("Create drop failed:", e); res.status(400).json({ error: "Invalid system data" }); }
 });
 app.put('/api/drops/:id', auth, async (req, res) => {
@@ -1093,10 +1162,49 @@ app.put('/api/drops/:id', auth, async (req, res) => {
         // findByIdAndUpdate throws a CastError on a malformed :id (not a valid ObjectId) — was
         // uncaught here, which without this try/catch depends on the global error handler below
         // (and, before that existed, could surface a raw stack trace instead of a clean 400).
-        const u = await PC.findByIdAndUpdate(req.params.id, req.body, { new: true, runValidators: true });
+        //
+        // `reviews` is stripped: the panel loads a PC's reviews when EDIT is clicked and used to send
+        // that whole array back on save, so any customer review posted in between was silently
+        // overwritten by the admin's stale copy. Reviews on an existing PC are only ever changed
+        // through the dedicated add/remove routes below, which touch one entry at a time.
+        const { reviews, ...update } = normalizePriceFields(req.body || {});
+        const u = await PC.findByIdAndUpdate(req.params.id, update, { new: true, runValidators: true });
         if (!u) return res.status(404).json({ error: "PC not found" });
         res.json(u);
     } catch (e) { console.error("Update drop failed:", e); res.status(400).json({ error: "Invalid system data or id" }); }
+});
+
+// Manual reviews added from the admin panel. One entry per call via $push / $pull, so an admin
+// edit and a customer's review landing at the same moment can no longer overwrite each other.
+app.post('/api/drops/:id/reviews', auth, async (req, res) => {
+    try {
+        const user = asString(req.body.user).trim().slice(0, 40);
+        const text = asString(req.body.text).trim().slice(0, 1000);
+        const rating = Number(req.body.rating);
+        if (!user || !text) return res.status(400).json({ error: "User and text required" });
+        if (!Number.isInteger(rating) || rating < 1 || rating > 5) {
+            return res.status(400).json({ error: "Rating must be a whole number from 1 to 5" });
+        }
+        const u = await PC.findByIdAndUpdate(
+            req.params.id,
+            { $push: { reviews: { user, text, rating, date: new Date() } } },
+            { new: true }
+        );
+        if (!u) return res.status(404).json({ error: "PC not found" });
+        res.json({ success: true, reviews: u.reviews });
+    } catch (e) { console.error("Add review failed:", e); res.status(400).json({ error: "Invalid id" }); }
+});
+
+app.delete('/api/drops/:id/reviews/:reviewId', auth, async (req, res) => {
+    try {
+        const u = await PC.findByIdAndUpdate(
+            req.params.id,
+            { $pull: { reviews: { _id: req.params.reviewId } } },
+            { new: true }
+        );
+        if (!u) return res.status(404).json({ error: "PC not found" });
+        res.json({ success: true, reviews: u.reviews });
+    } catch (e) { console.error("Remove review failed:", e); res.status(400).json({ error: "Invalid id" }); }
 });
 app.delete('/api/drops/:id', auth, async (req, res) => {
     try {
@@ -1120,6 +1228,7 @@ app.get('/api/vote-event', async (req, res) => {
                 await new PC({
                     name: event.title,
                     price: event.price || '',
+                    priceCents: event.priceCents,
                     images: event.image ? [event.image] : [],
                     status: 'available',
                     category: 'drop',
@@ -1154,8 +1263,11 @@ app.get('/api/vote-event', async (req, res) => {
 });
 app.post('/api/vote-event', auth, async (req, res) => {
     try {
+        // Validated before anything is deleted: a bad price used to wipe the running event first
+        // and only then fail to create its replacement, leaving no event at all.
+        const n = new VoteEvent(normalizePriceFields(req.body));
+        await n.validate();
         await VoteEvent.deleteMany({});
-        const n = new VoteEvent(req.body);
         await n.save();
         res.json(n);
     } catch (e) { console.error("Create vote-event failed:", e); res.status(400).json({ error: "Invalid vote event data" }); }
@@ -1298,13 +1410,29 @@ app.post('/api/submit-review', authLimiter, async (req, res) => {
             if (new Date() > expiry) return res.status(403).json({ error: "This code has expired" });
         }
 
-        const pc = await PC.findById(ticket.pcId);
-        if (!pc) return res.status(404).json({ error: "PC not found" });
+        if (!await PC.exists({ _id: ticket.pcId })) return res.status(404).json({ error: "PC not found" });
 
-        pc.reviews.push({ user, rating, text, date: new Date() });
-        await pc.save();
-        ticket.status = 'used';
-        await ticket.save();
+        // Claim the ticket atomically BEFORE writing the review. The old order was read status ->
+        // push review -> mark used, so two submits with the same code landing together (a double
+        // tap, a retried request) both passed the `status === 'used'` check above and both posted.
+        // Putting "not yet used" in the match means only one request can ever flip it.
+        const claimed = await ReviewTicket.findOneAndUpdate(
+            { _id: ticket._id, status: { $ne: 'used' } },
+            { $set: { status: 'used' } }
+        );
+        if (!claimed) return res.status(409).json({ error: "This code has already been redeemed" });
+
+        // $push rather than load-modify-save of the whole PC document: a concurrent admin edit of
+        // this same PC then can't be overwritten by this write, or vice versa.
+        const pushed = await PC.updateOne(
+            { _id: ticket.pcId },
+            { $push: { reviews: { user, rating, text, date: new Date() } } }
+        );
+        if (!pushed.matchedCount) {
+            // The PC was deleted between the check above and here — give the customer their code back
+            await ReviewTicket.updateOne({ _id: ticket._id }, { $set: { status: ticket.status } });
+            return res.status(404).json({ error: "PC not found" });
+        }
 
         // The route stays open to guests — a mission code is the proof of purchase, not a login —
         // but when the browser does have a session, credit the account so 'field_report' becomes
