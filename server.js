@@ -217,6 +217,9 @@ const pcSchema = new mongoose.Schema({
     fps: [{ game: String, score: Number }],
     reviews: [{ user: String, text: String, rating: Number, date: { type: Date, default: Date.now } }],
     votes: { type: Number, default: 0 },
+    // Set on the PC a community vote turned into a regular listing (resolveVoteEvent) — the card
+    // shows a COMMUNITY DROP badge for it.
+    communityDrop: { type: Boolean, default: false },
     // Per-build purchasable extras. Every sub-field has a default so PCs created before this
     // existed still render (the frontend also guards with optional chaining).
     options: {
@@ -309,9 +312,79 @@ const voteEventSchema = new mongoose.Schema({
     lore: String,
     loreEl: String,
     multitasking: { type: Number, default: 0 },
-    fps: [{ game: String, score: Number }]
+    fps: [{ game: String, score: Number }],
+    // How the vote ended. 'open' while it runs; 'unlocked' when the community reached the target;
+    // 'closed' when the timer ran out first. Either way the drop becomes a regular PC in LIVE DROPS
+    // (pcId) and the event stays on the VOTE tab, pointing there, until the admin starts the next
+    // one. Events saved before this field existed have no status and are treated as 'open'.
+    status: { type: String, enum: ['open', 'unlocked', 'closed'], default: 'open' },
+    pcId: { type: mongoose.Schema.Types.ObjectId, ref: 'PC' },
+    resolvedAt: Date
 });
 const VoteEvent = mongoose.model('VoteEvent', voteEventSchema);
+
+// [start, end] of a vote event's window; end is null when the event has no start date
+function voteWindow(event) {
+    if (!event.startDate) return { start: null, end: null };
+    const start = new Date(event.startDate);
+    return { start, end: new Date(start.getTime() + (event.durationDays || 0) * 24 * 60 * 60 * 1000) };
+}
+
+function voteResolved(event) {
+    return event.status === 'unlocked' || event.status === 'closed';
+}
+
+// What the VOTE tab should show, decided here rather than from the visitor's own clock
+function votePhase(event, now) {
+    if (voteResolved(event)) return event.status;
+    const { start } = voteWindow(event);
+    return start && now < start ? 'upcoming' : 'open';
+}
+
+// Ends a community vote by turning the drop into a regular PC in LIVE DROPS — when the target is
+// reached ('unlocked') or when the timer runs out without it ('closed'). The event is CLAIMED
+// atomically first: only the request that flips it out of 'open' creates the PC, so a burst of last
+// votes, or GETs queued while the free dyno wakes up, can't list the same drop twice (the old
+// expiry code could). Every field the inspect card uses is copied — the old conversion dropped the
+// lore, description and FPS.
+async function resolveVoteEvent(event, outcome) {
+    const pcId = new mongoose.Types.ObjectId();
+    const claimed = await VoteEvent.findOneAndUpdate(
+        { _id: event._id, status: { $nin: ['unlocked', 'closed'] } },
+        { $set: { status: outcome, pcId, resolvedAt: new Date() } },
+        { new: true }
+    );
+    if (!claimed) return (await VoteEvent.findById(event._id)) || event; // another request got there first
+
+    const ev = claimed.toObject();
+    const hasPrice = Number.isFinite(ev.priceCents) && ev.priceCents > 0;
+    try {
+        await new PC({
+            _id: pcId,
+            name: ev.title,
+            price: hasPrice ? ev.price : '',
+            priceCents: hasPrice ? ev.priceCents : undefined,
+            description: ev.description || '',
+            lore: ev.lore || '',
+            loreEl: ev.loreEl || '',
+            images: ev.image ? [ev.image] : [],
+            specs: ev.specs || {},
+            fps: (ev.fps || []).map(f => ({ game: f.game, score: f.score })),
+            multitasking: ev.multitasking || 0,
+            // No price yet: listed as COMING SOON (shown, not orderable) until the admin sets one,
+            // instead of an orderable PC at 0,00 €
+            status: hasPrice ? 'available' : 'coming',
+            category: 'drop',
+            stock: 1,
+            communityDrop: true
+        }).save();
+    } catch (e) {
+        // Release the claim so the next read retries, instead of pointing at a PC that doesn't exist
+        await VoteEvent.updateOne({ _id: claimed._id }, { $set: { status: 'open' }, $unset: { pcId: 1, resolvedAt: 1 } });
+        throw e;
+    }
+    return claimed;
+}
 
 const reviewTicketSchema = new mongoose.Schema({
     code: { type: String, index: true }, pcId: String, pcName: String,
@@ -325,6 +398,11 @@ const ReviewTicket = mongoose.model('ReviewTicket', reviewTicketSchema);
 // checks it once per unearned "signal_intercepted" — both are exact-match reads on every call.
 const newsletterSchema = new mongoose.Schema({ email: { type: String, index: true }, date: { type: Date, default: Date.now } });
 const Newsletter = mongoose.model('Newsletter', newsletterSchema);
+
+// Default "How it works" text for the VOTE tab, until the admin writes their own (GLOBAL SETTINGS).
+// One copy, used both as the schema default and as the /api/status fallback.
+const DEFAULT_VOTE_INFO_EN = "Community drops: the network votes to unlock a mystery PC.\n\n1. Voting opens on the date shown.\n2. Every signed-in agent with a verified email gets one vote.\n3. Reach the target before time runs out and the PC unlocks — it goes straight to Live Drops, ready to order.\n4. If time runs out first, the PC still comes to Live Drops when voting closes.";
+const DEFAULT_VOTE_INFO_EL = "Κοινοτικά drops: η κοινότητα ψηφίζει για να ξεκλειδώσει ένα μυστηριώδες PC.\n\n1. Η ψηφοφορία ανοίγει την ημερομηνία που φαίνεται.\n2. Κάθε συνδεδεμένος πράκτορας με επιβεβαιωμένο email έχει μία ψήφο.\n3. Αν μαζευτούν οι ψήφοι πριν λήξει ο χρόνος, το PC ξεκλειδώνει και μπαίνει αμέσως στα Live Drops, έτοιμο για παραγγελία.\n4. Αν λήξει πρώτα ο χρόνος, το PC έρχεται κι αυτό στα Live Drops με το κλείσιμο της ψηφοφορίας.";
 
 const siteConfigSchema = new mongoose.Schema({
     maintenanceMode: { type: Boolean, default: false },
@@ -341,11 +419,11 @@ const siteConfigSchema = new mongoose.Schema({
     // escaping is needed and no markup can be injected through it.
     voteInfoText: {
         type: String,
-        default: "Vote is a community system: the network votes on which mystery PC gets unlocked for purchase.\n\n1. Voting opens at the specified date.\n2. Reach target votes to unlock drops.\n3. Only signed-in, verified agents can vote.\n4. If the system isn't secured before the timer runs out, it automatically moves to Live Drops."
+        default: DEFAULT_VOTE_INFO_EN
     },
     voteInfoTextEl: {
         type: String,
-        default: "Το Vote είναι ένα κοινοτικό σύστημα: η ομάδα ψηφίζει ποιο  PC θα ξεκλειδωθεί για αγορά.\n\n1. Η ψηφοφορία ανοίγει στην καθορισμένη ημερομηνία.\n2. Συγκεντρώστε τις απαιτούμενες ψήφους για να ξεκλειδώσει το drop.\n3. Μόνο συνδεδεμένοι, επιβεβαιωμένοι πράκτορες μπορούν να ψηφίσουν.\n4. Αν το σύστημα δεν εξασφαλιστεί πριν λήξει το χρονόμετρο, μεταφέρεται αυτόματα στα Live Drops."
+        default: DEFAULT_VOTE_INFO_EL
     }
 });
 const SiteConfig = mongoose.model('SiteConfig', siteConfigSchema);
@@ -763,8 +841,8 @@ app.get('/api/status', async (req, res) => {
         // back to the schema defaults (duplicated here, same as proConfigPrice above) because this
         // route never creates a SiteConfig document — only the admin GET does, on first visit —
         // so a site where the admin panel has never been opened must still show sensible copy.
-        voteInfoText: config?.voteInfoText || "Vote is a community system: the network votes on which mystery PC gets unlocked for purchase.\n\n1. Voting opens at the specified date.\n2. Reach target votes to unlock drops.\n3. Only signed-in, verified agents can vote.\n4. If the system isn't secured before the timer runs out, it automatically moves to Live Drops.",
-        voteInfoTextEl: config?.voteInfoTextEl || "Το Vote είναι ένα κοινοτικό σύστημα: η ομάδα ψηφίζει ποιο μυστηριώδες PC θα ξεκλειδωθεί για αγορά.\n\n1. Η ψηφοφορία ανοίγει στην καθορισμένη ημερομηνία.\n2. Συγκεντρώστε τις απαιτούμενες ψήφους για να ξεκλειδώσει το drop.\n3. Μόνο συνδεδεμένοι, επιβεβαιωμένοι πράκτορες μπορούν να ψηφίσουν.\n4. Αν το σύστημα δεν εξασφαλιστεί πριν λήξει το χρονόμετρο, μεταφέρεται αυτόματα στα Live Drops.",
+        voteInfoText: config?.voteInfoText || DEFAULT_VOTE_INFO_EN,
+        voteInfoTextEl: config?.voteInfoTextEl || DEFAULT_VOTE_INFO_EL,
         // Diagnostics. Says whether the allowlist is configured at all and whether THIS caller's
         // origin is on it — the caller already knows its own origin, so nothing leaks, and a
         // silent CORS refusal becomes a one-request check instead of a log hunt.
@@ -1216,30 +1294,24 @@ app.delete('/api/drops/:id', auth, async (req, res) => {
 
 app.get('/api/vote-event', async (req, res) => {
     try {
-        const event = await VoteEvent.findOne();
-        if (event && event.startDate) {
-            const end = new Date(new Date(event.startDate).getTime() + (event.durationDays || 0) * 24 * 60 * 60 * 1000);
-            const expired = new Date() > end;
-            const secured = event.currentVotes >= event.targetVotes;
-            // Un-secured community drops auto-convert to a normal Live Drop once their timer runs out
-            // (checked lazily here, on read, rather than a background timer — this dyno sleeps on
-            // idle on Render's free tier, so a setInterval wouldn't reliably fire anyway).
-            if (expired && !secured) {
-                await new PC({
-                    name: event.title,
-                    price: event.price || '',
-                    priceCents: event.priceCents,
-                    images: event.image ? [event.image] : [],
-                    status: 'available',
-                    category: 'drop',
-                    stock: 1,
-                    specs: event.specs || {}
-                }).save();
-                await VoteEvent.deleteMany({});
-                return res.json({});
+        let event = await VoteEvent.findOne();
+        if (!event) return res.json({});
+
+        // Resolved lazily, on read, rather than by a background timer — this dyno sleeps on idle on
+        // Render's free tier, so a setInterval wouldn't reliably fire. Catches an expired event, and
+        // one that reached its target some other way (an event from before unlocking existed, or
+        // the admin lowering the target).
+        const now = new Date();
+        if (!voteResolved(event)) {
+            const { end } = voteWindow(event);
+            try {
+                if (event.targetVotes > 0 && event.currentVotes >= event.targetVotes) event = await resolveVoteEvent(event, 'unlocked');
+                else if (end && now > end) event = await resolveVoteEvent(event, 'closed');
+            } catch (e) {
+                // Still answer with the event as it stands; the next read tries again
+                console.error("Resolving vote event failed:", e);
             }
         }
-        if (!event) return res.json({});
 
         // Optional auth: this route stays public (guests must still see the drop), but when a
         // valid token is present we tell that agent whether they've already used their vote.
@@ -1255,7 +1327,8 @@ app.get('/api/vote-event', async (req, res) => {
 
         const payload = event.toObject();
         delete payload.votedBy; // never leak the voter list
-        res.json({ ...payload, hasVoted });
+        // phase/endsAt/serverNow: the tab's state comes from the server's clock, not the visitor's
+        res.json({ ...payload, hasVoted, phase: votePhase(event, now), endsAt: voteWindow(event).end, serverNow: now });
     } catch (e) {
         console.error("Vote event fetch/expiry check failed:", e);
         res.json({});
@@ -1266,11 +1339,23 @@ app.post('/api/vote-event', auth, async (req, res) => {
         // Validated before anything is deleted: a bad price used to wipe the running event first
         // and only then fail to create its replacement, leaving no event at all.
         const n = new VoteEvent(normalizePriceFields(req.body));
+        // A new event always starts open, whatever the request body says
+        n.status = 'open';
+        n.pcId = undefined;
+        n.resolvedAt = undefined;
         await n.validate();
         await VoteEvent.deleteMany({});
         await n.save();
         res.json(n);
     } catch (e) { console.error("Create vote-event failed:", e); res.status(400).json({ error: "Invalid vote event data" }); }
+});
+// Clears the VOTE tab (after a drop has been resolved, or to cancel one). A PC the event already
+// turned into stays in LIVE DROPS — that's a normal PC now, edited or deleted like any other.
+app.delete('/api/vote-event', auth, async (req, res) => {
+    try {
+        await VoteEvent.deleteMany({});
+        res.json({ msg: "Deleted" });
+    } catch (e) { console.error("Delete vote-event failed:", e); res.status(500).json({ error: "Server Error" }); }
 });
 app.post('/api/cast-vote', authUser, requireVerified, async (req, res) => {
     try {
@@ -1282,29 +1367,45 @@ app.post('/api/cast-vote', authUser, requireVerified, async (req, res) => {
             return res.status(409).json({ error: "ALREADY VOTED", votes: event.currentVotes, hasVoted: true });
         }
 
+        // Already unlocked or closed: the drop is a regular PC in LIVE DROPS now
+        if (voteResolved(event)) {
+            return res.status(409).json({ error: "VOTING HAS CLOSED", code: "VOTE_CLOSED", phase: event.status, pcId: event.pcId, votes: event.currentVotes });
+        }
+
         // The client disables the button outside the window, but the API has to enforce it too
-        if (event.startDate) {
+        const { start, end } = voteWindow(event);
+        if (start) {
             const now = new Date();
-            const start = new Date(event.startDate);
-            const end = new Date(start.getTime() + (event.durationDays || 0) * 24 * 60 * 60 * 1000);
-            if (now < start) return res.status(403).json({ error: "VOTING HAS NOT OPENED YET" });
-            if (now > end) return res.status(403).json({ error: "VOTING HAS CLOSED" });
+            if (now < start) return res.status(403).json({ error: "VOTING HAS NOT OPENED YET", code: "VOTE_NOT_OPEN" });
+            if (now > end) return res.status(409).json({ error: "VOTING HAS CLOSED", code: "VOTE_CLOSED" });
         }
 
         // Read-modify-write on the document lost votes under concurrency: two requests landing
         // together both read the same currentVotes and the second save overwrote the first. One
-        // atomic update instead, with "hasn't voted yet" as part of the match — so the database,
-        // not a prior read, is what enforces one-vote-per-account.
+        // atomic update instead, with "hasn't voted yet" — and "still open" — as part of the match,
+        // so the database, not a prior read, enforces one vote per account and no votes after unlock.
         const updated = await VoteEvent.findOneAndUpdate(
-            { _id: event._id, votedBy: { $ne: req.userId } },
+            { _id: event._id, votedBy: { $ne: req.userId }, status: { $nin: ['unlocked', 'closed'] } },
             { $addToSet: { votedBy: req.userId }, $inc: { currentVotes: 1 } },
             { new: true }
         );
         if (!updated) {
-            // Matched nothing: this account's vote was already recorded between the check above
-            // and here (double-click, two tabs). Report the current count rather than a failure.
-            const fresh = await VoteEvent.findById(event._id).select('currentVotes');
+            // Matched nothing: either this account's vote landed between the check above and here
+            // (double-click, two tabs), or the vote just before this one unlocked the drop.
+            const fresh = await VoteEvent.findById(event._id).select('currentVotes status pcId');
+            if (fresh && voteResolved(fresh)) {
+                return res.status(409).json({ error: "VOTING HAS CLOSED", code: "VOTE_CLOSED", phase: fresh.status, pcId: fresh.pcId, votes: fresh.currentVotes });
+            }
             return res.status(409).json({ error: "ALREADY VOTED", votes: fresh?.currentVotes ?? event.currentVotes, hasVoted: true });
+        }
+
+        // This vote reached the target: the drop unlocks now and goes straight to LIVE DROPS
+        let unlocked = null;
+        if (updated.targetVotes > 0 && updated.currentVotes >= updated.targetVotes) {
+            // The vote itself is already counted; if creating the PC fails, the next GET retries the
+            // unlock (resolveVoteEvent released its claim), so this must not turn into a failed vote.
+            try { unlocked = await resolveVoteEvent(updated, 'unlocked'); }
+            catch (e) { console.error("Unlocking vote drop failed (will retry on next read):", e); }
         }
 
         // Counted on the account as well as the event, because the event is deleted when it
@@ -1317,7 +1418,12 @@ app.post('/api/cast-vote', authUser, requireVerified, async (req, res) => {
             profile = await syncAchievements(user);
         }
 
-        res.json({ votes: updated.currentVotes, hasVoted: true, profile });
+        res.json({
+            votes: updated.currentVotes, hasVoted: true, profile,
+            // The client plays the "unlocked → LIVE DROPS" sequence when this vote is the one that did it
+            phase: unlocked ? unlocked.status : 'open',
+            pcId: unlocked ? unlocked.pcId : undefined
+        });
     } catch (e) {
         console.error("Cast vote failed:", e);
         res.status(500).json({ error: "Server Error" });
