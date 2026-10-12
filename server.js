@@ -220,6 +220,9 @@ const pcSchema = new mongoose.Schema({
     // Set on the PC a community vote turned into a regular listing (resolveVoteEvent) — the card
     // shows a COMMUNITY DROP badge for it.
     communityDrop: { type: Boolean, default: false },
+    // Early access: a drop the community unlocked before its timer ran out can be ordered only by
+    // signed-in members until then (the vote's end), and by everyone after. Unset = public.
+    membersOnlyUntil: Date,
     // Per-build purchasable extras. Every sub-field has a default so PCs created before this
     // existed still render (the frontend also guards with optional chaining).
     options: {
@@ -358,6 +361,7 @@ async function resolveVoteEvent(event, outcome) {
 
     const ev = claimed.toObject();
     const hasPrice = Number.isFinite(ev.priceCents) && ev.priceCents > 0;
+    const { end } = voteWindow(claimed);
     try {
         await new PC({
             _id: pcId,
@@ -376,7 +380,9 @@ async function resolveVoteEvent(event, outcome) {
             status: hasPrice ? 'available' : 'coming',
             category: 'drop',
             stock: 1,
-            communityDrop: true
+            communityDrop: true,
+            // Unlocked in time: members get it first, until the vote would have ended
+            membersOnlyUntil: (outcome === 'unlocked' && end && end > new Date()) ? end : undefined
         }).save();
     } catch (e) {
         // Release the claim so the next read retries, instead of pointing at a PC that doesn't exist
@@ -401,8 +407,8 @@ const Newsletter = mongoose.model('Newsletter', newsletterSchema);
 
 // Default "How it works" text for the VOTE tab, until the admin writes their own (GLOBAL SETTINGS).
 // One copy, used both as the schema default and as the /api/status fallback.
-const DEFAULT_VOTE_INFO_EN = "Community drops: the network votes to unlock a mystery PC.\n\n1. Voting opens on the date shown.\n2. Every signed-in agent with a verified email gets one vote.\n3. Reach the target before time runs out and the PC unlocks — it goes straight to Live Drops, ready to order.\n4. If time runs out first, the PC still comes to Live Drops when voting closes.";
-const DEFAULT_VOTE_INFO_EL = "Κοινοτικά drops: η κοινότητα ψηφίζει για να ξεκλειδώσει ένα μυστηριώδες PC.\n\n1. Η ψηφοφορία ανοίγει την ημερομηνία που φαίνεται.\n2. Κάθε συνδεδεμένος πράκτορας με επιβεβαιωμένο email έχει μία ψήφο.\n3. Αν μαζευτούν οι ψήφοι πριν λήξει ο χρόνος, το PC ξεκλειδώνει και μπαίνει αμέσως στα Live Drops, έτοιμο για παραγγελία.\n4. Αν λήξει πρώτα ο χρόνος, το PC έρχεται κι αυτό στα Live Drops με το κλείσιμο της ψηφοφορίας.";
+const DEFAULT_VOTE_INFO_EN = "Community drops: the network votes to unlock a mystery PC.\n\n1. Voting opens on the date shown.\n2. Every signed-in agent with a verified email gets one vote.\n3. Reach the target before time runs out and the PC unlocks straight into Live Drops — signed-in members can order it first, until the timer would have ended; then it is open to everyone.\n4. If time runs out first, the PC still comes to Live Drops when voting closes.";
+const DEFAULT_VOTE_INFO_EL = "Κοινοτικά drops: η κοινότητα ψηφίζει για να ξεκλειδώσει ένα μυστηριώδες PC.\n\n1. Η ψηφοφορία ανοίγει την ημερομηνία που φαίνεται.\n2. Κάθε συνδεδεμένος πράκτορας με επιβεβαιωμένο email έχει μία ψήφο.\n3. Αν μαζευτούν οι ψήφοι πριν λήξει ο χρόνος, το PC ξεκλειδώνει και μπαίνει αμέσως στα Live Drops — με προτεραιότητα για τα συνδεδεμένα μέλη μέχρι να έληγε ο χρόνος, και μετά για όλους.\n4. Αν λήξει πρώτα ο χρόνος, το PC έρχεται κι αυτό στα Live Drops με το κλείσιμο της ψηφοφορίας.";
 
 const siteConfigSchema = new mongoose.Schema({
     maintenanceMode: { type: Boolean, default: false },
