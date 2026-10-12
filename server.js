@@ -292,8 +292,17 @@ const userSchema = new mongoose.Schema({
     // Set by /api/report-unauthorized-signup. Checked at login (after the password matches, so a
     // brute-force attempt without the real password never learns an account is in this state) and
     // enforced immediately on any live session via the tokenVersion bump that accompanies it.
-    securityLockedUntil: Date
+    securityLockedUntil: Date,
+    // Daily wheel, decided here rather than in the browser — a spin the client decides can be faked
+    // from devtools, and a coupon is worth real money. See POST /api/wheel/spin.
+    wheelAttemptsLeft: { type: Number, default: 3 },
+    wheelNextAt: Date,
+    unlockedColors: { type: [String], default: [] },
+    // Discount codes won on the wheel. The order is a WhatsApp message, so the shop checks a code in
+    // the admin panel and redeems it there (usedAt).
+    coupons: [{ code: String, percent: Number, issuedAt: Date, expiresAt: Date, usedAt: Date }]
 });
+userSchema.index({ 'coupons.code': 1 }, { sparse: true });
 const User = mongoose.model('User', userSchema);
 
 const voteEventSchema = new mongoose.Schema({
@@ -1079,8 +1088,122 @@ app.get('/api/me', authUser, requireVerified, async (req, res) => {
         // routes do.
         const profile = await syncAchievements(user);
         await user.populate('wishlist');
-        res.json({ username: user.username, wishlist: user.wishlist, ...profile });
+        res.json({ username: user.username, wishlist: user.wishlist, ...profile, coupons: couponsFor(user), unlockedColors: user.unlockedColors || [] });
     } catch (e) { console.error("/api/me failed:", e); res.status(500).json({ error: "Server Error" }); }
+});
+
+// --- DAILY WHEEL + COUPONS ---
+// Same slice order as WHEEL slices in the frontend (js/modules/wheel.js) — the server answers with an
+// index and the wheel animates to it.
+const WHEEL_SLICES = [
+    { type: 'blank' }, { type: 'color', id: 'cyberGold' }, { type: 'coupon' }, { type: 'color', id: 'toxicOrange' },
+    { type: 'blank' }, { type: 'color', id: 'neonPink' }, { type: 'coupon' }, { type: 'color', id: 'matrixGreen' }
+];
+const WHEEL_MAX_ATTEMPTS = 3;
+const WHEEL_COOLDOWN_MS = 24 * 60 * 60 * 1000;
+const COUPON_PERCENT = 5;
+const COUPON_DAYS = 30;
+const COUPON_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'; // no 0/O, 1/I/L — read aloud over WhatsApp
+// One spin at a time per account (a double tap must not become two spins)
+const spinsInFlight = new Set();
+
+function wheelStatus(user, now = new Date()) {
+    let left = Number.isFinite(user.wheelAttemptsLeft) ? user.wheelAttemptsLeft : WHEEL_MAX_ATTEMPTS;
+    let next = user.wheelNextAt || null;
+    if (left <= 0 && (!next || now >= next)) { left = WHEEL_MAX_ATTEMPTS; next = null; }
+    return { attemptsLeft: left, maxAttempts: WHEEL_MAX_ATTEMPTS, nextAvailableAt: left > 0 ? null : next };
+}
+
+// What the account sees: codes not past expiry (used ones stay listed, marked used, for 30 days)
+function couponsFor(user, now = new Date()) {
+    return (user.coupons || [])
+        .filter(c => c.expiresAt && c.expiresAt > now)
+        .map(c => ({ code: c.code, percent: c.percent, issuedAt: c.issuedAt, expiresAt: c.expiresAt, usedAt: c.usedAt || null }))
+        .sort((a, b) => new Date(b.issuedAt) - new Date(a.issuedAt));
+}
+
+async function newCouponCode() {
+    for (let i = 0; i < 6; i++) {
+        let code = 'CDX-';
+        for (let j = 0; j < 6; j++) code += COUPON_ALPHABET[crypto.randomInt(COUPON_ALPHABET.length)];
+        if (!(await User.exists({ 'coupons.code': code }))) return code;
+    }
+    throw new Error('Could not generate a unique coupon code');
+}
+
+app.get('/api/wheel', authUser, requireVerified, async (req, res) => {
+    try {
+        const user = await User.findById(req.userId);
+        if (!user) return res.status(404).json({ error: "User not found" });
+        res.json({ ...wheelStatus(user), coupons: couponsFor(user), unlockedColors: user.unlockedColors || [] });
+    } catch (e) { console.error("Wheel status failed:", e); res.status(500).json({ error: "Server Error" }); }
+});
+
+app.post('/api/wheel/spin', authUser, requireVerified, async (req, res) => {
+    if (spinsInFlight.has(req.userId)) return res.status(429).json({ error: "SPIN IN PROGRESS", code: "SPIN_BUSY" });
+    spinsInFlight.add(req.userId);
+    try {
+        const user = await User.findById(req.userId);
+        if (!user) return res.status(404).json({ error: "User not found" });
+        const now = new Date();
+        const status = wheelStatus(user, now);
+        if (status.attemptsLeft <= 0) {
+            return res.status(429).json({ error: "NO SPINS LEFT", code: "NO_SPINS", nextAvailableAt: status.nextAvailableAt });
+        }
+
+        const index = crypto.randomInt(WHEEL_SLICES.length);
+        const slice = WHEEL_SLICES[index];
+        const win = slice.type !== 'blank';
+        const left = status.attemptsLeft - 1;
+        // A win ends the cycle at once; so does using the last attempt
+        user.wheelAttemptsLeft = win ? 0 : left;
+        user.wheelNextAt = (win || left <= 0) ? new Date(now.getTime() + WHEEL_COOLDOWN_MS) : null;
+
+        const reward = { type: slice.type };
+        if (slice.type === 'color') {
+            reward.id = slice.id;
+            reward.alreadyUnlocked = (user.unlockedColors || []).includes(slice.id);
+            if (!reward.alreadyUnlocked) user.unlockedColors.push(slice.id);
+        } else if (slice.type === 'coupon') {
+            const coupon = { code: await newCouponCode(), percent: COUPON_PERCENT, issuedAt: now, expiresAt: new Date(now.getTime() + COUPON_DAYS * 24 * 60 * 60 * 1000) };
+            user.coupons.push(coupon);
+            reward.coupon = { code: coupon.code, percent: coupon.percent, expiresAt: coupon.expiresAt };
+        }
+        await user.save();
+
+        const after = wheelStatus(user, now);
+        res.json({ index, reward, ...after, coupons: couponsFor(user, now), unlockedColors: user.unlockedColors });
+    } catch (e) {
+        console.error("Wheel spin failed:", e);
+        res.status(500).json({ error: "Server Error" });
+    } finally {
+        spinsInFlight.delete(req.userId);
+    }
+});
+
+// Admin: look a code up (whose it is, valid or not), and mark it used once the order is agreed
+app.get('/api/admin/coupons/:code', auth, async (req, res) => {
+    try {
+        const code = String(req.params.code || '').trim().toUpperCase();
+        const user = await User.findOne({ 'coupons.code': code }).select('username email coupons');
+        const c = user && user.coupons.find(x => x.code === code);
+        if (!c) return res.status(404).json({ error: "Coupon not found" });
+        res.json({ code: c.code, percent: c.percent, username: user.username, email: user.email, issuedAt: c.issuedAt, expiresAt: c.expiresAt, usedAt: c.usedAt || null, expired: c.expiresAt <= new Date() });
+    } catch (e) { console.error("Coupon lookup failed:", e); res.status(500).json({ error: "Server Error" }); }
+});
+
+app.post('/api/admin/coupons/:code/redeem', auth, async (req, res) => {
+    try {
+        const code = String(req.params.code || '').trim().toUpperCase();
+        // Atomic: only an unused, unexpired code flips to used — redeeming twice can't succeed twice
+        const user = await User.findOneAndUpdate(
+            { coupons: { $elemMatch: { code, usedAt: null, expiresAt: { $gt: new Date() } } } },
+            { $set: { 'coupons.$.usedAt': new Date() } },
+            { new: true }
+        );
+        if (!user) return res.status(409).json({ error: "Coupon not found, already used or expired" });
+        res.json({ success: true, code, username: user.username });
+    } catch (e) { console.error("Coupon redeem failed:", e); res.status(500).json({ error: "Server Error" }); }
 });
 
 app.post('/api/wishlist/:pcId', authUser, requireVerified, async (req, res) => {
