@@ -215,7 +215,8 @@ const pcSchema = new mongoose.Schema({
     specs: { cpu: String, gpu: String, ram: String, ssd: String, mobo: String, psu: String, case: String },
     specDetails: { type: Map, of: String, default: {} },
     fps: [{ game: String, score: Number }],
-    reviews: [{ user: String, text: String, rating: Number, date: { type: Date, default: Date.now } }],
+    // rank: the reviewer's rank when they wrote it, if they were signed in (the badge by the name)
+    reviews: [{ user: String, text: String, rating: Number, rank: String, date: { type: Date, default: Date.now } }],
     votes: { type: Number, default: 0 },
     // Set on the PC a community vote turned into a regular listing (resolveVoteEvent) — the card
     // shows a COMMUNITY DROP badge for it.
@@ -298,6 +299,11 @@ const userSchema = new mongoose.Schema({
     wheelAttemptsLeft: { type: Number, default: 3 },
     wheelNextAt: Date,
     unlockedColors: { type: [String], default: [] },
+    // Rank rewards (grantRankRewards): the ranks already paid out, and the bonus spins they gave that
+    // haven't been used yet — banked, spent only after the day's own attempts, and they never touch
+    // the daily cooldown
+    rankRewardsClaimed: { type: [String], default: [] },
+    bonusSpins: { type: Number, default: 0, min: 0 },
     // Discount codes won on the wheel. The order is a WhatsApp message, so the shop checks a code in
     // the admin panel and redeems it there (usedAt).
     coupons: [{ code: String, percent: Number, issuedAt: Date, expiresAt: Date, usedAt: Date }]
@@ -549,14 +555,47 @@ const CLIENT_ACHIEVEMENT_IDS = new Set(ACHIEVEMENTS.filter(a => a.source === 'cl
 const LEGACY_ACHIEVEMENT_IDS = { login: 'recruited', cart: 'first_loot', vote: 'vote_caster' };
 
 // Ascending by minXp — rankFor() walks it backwards, so the order here is what defines the ladder.
+// What each rank gives, once, the first time the account reaches it (grantRankRewards): a badge (the
+// rank itself — shown on the profile and next to the name on reviews), and maybe an accent colour that
+// only a rank unlocks (never on the wheel) and bonus wheel spins. Decided and stored here, never by
+// the browser — the same reason the wheel is server-side.
 const RANKS = [
-    { id: 'recruit',    minXp: 0 },
-    { id: 'operative',  minXp: 100 },
-    { id: 'fieldAgent', minXp: 250 },
-    { id: 'specialist', minXp: 450 },
-    { id: 'eliteAgent', minXp: 700 },
-    { id: 'phantom',    minXp: 1000 }
+    { id: 'recruit',    minXp: 0,    rewards: {} },
+    { id: 'operative',  minXp: 100,  rewards: { spins: 1 } },
+    { id: 'fieldAgent', minXp: 250,  rewards: { color: 'ultraviolet' } },
+    { id: 'specialist', minXp: 450,  rewards: { spins: 2 } },
+    { id: 'eliteAgent', minXp: 700,  rewards: { color: 'arctic', spins: 1 } },
+    { id: 'phantom',    minXp: 1000, rewards: { color: 'phantom', spins: 3 } }
 ];
+// The ladder as the profile shows it (thresholds + rewards), sent with every profile so the frontend
+// never keeps its own copy of the numbers
+const RANK_LADDER = RANKS.map(r => ({ id: r.id, minXp: r.minXp, rewards: { ...r.rewards } }));
+
+const xpOf = (achievementIds) => (achievementIds || []).reduce((sum, id) => sum + (ACHIEVEMENT_XP.get(id) || 0), 0);
+
+// Hands out the rewards of every rank the account has reached but not been paid for yet, on the
+// document (the caller saves). Each rank pays once, ever — rankRewardsClaimed — so XP dropping and
+// rising again can't farm it. Returns what was granted just now, for the "rank up" notice.
+function grantRankRewards(user, xp) {
+    const claimed = new Set(user.rankRewardsClaimed || []);
+    const granted = [];
+    for (const r of RANKS) {
+        if (xp < r.minXp || claimed.has(r.id)) continue;
+        claimed.add(r.id);
+        const g = { rank: r.id };
+        if (r.rewards.color) {
+            if (!(user.unlockedColors || []).includes(r.rewards.color)) user.unlockedColors.push(r.rewards.color);
+            g.color = r.rewards.color;
+        }
+        if (r.rewards.spins) {
+            user.bonusSpins = (user.bonusSpins || 0) + r.rewards.spins;
+            g.spins = r.rewards.spins;
+        }
+        granted.push(g);
+    }
+    if (granted.length) user.rankRewardsClaimed = RANKS.map(r => r.id).filter(id => claimed.has(id));
+    return granted;
+}
 
 function rankFor(xp) {
     let current = RANKS[0];
@@ -615,13 +654,20 @@ async function syncAchievements(user) {
     const list = ACHIEVEMENTS.map(a => a.id).filter(id => earned.has(id));
     const changed = list.length !== (user.achievements || []).length
         || list.some((id, i) => user.achievements[i] !== id);
-    if (changed) {
-        user.achievements = list;
-        await user.save();
-    }
+    if (changed) user.achievements = list;
 
-    const xp = list.reduce((sum, id) => sum + (ACHIEVEMENT_XP.get(id) || 0), 0);
-    return { achievements: list, xp, ...rankFor(xp) };
+    const xp = xpOf(list);
+    // Accounts that were already past a rank before rewards existed get paid on their next load
+    const rankRewards = grantRankRewards(user, xp);
+    if (changed || rankRewards.length) await user.save();
+
+    return {
+        achievements: list, xp, ...rankFor(xp),
+        ranks: RANK_LADDER,
+        bonusSpins: user.bonusSpins || 0,
+        // Non-empty only on the request that paid them out — the frontend shows it once
+        rankRewards
+    };
 }
 
 // --- 📧 EMAIL DELIVERY (Mailjet Send API v3.1) ---
@@ -1111,7 +1157,8 @@ function wheelStatus(user, now = new Date()) {
     let left = Number.isFinite(user.wheelAttemptsLeft) ? user.wheelAttemptsLeft : WHEEL_MAX_ATTEMPTS;
     let next = user.wheelNextAt || null;
     if (left <= 0 && (!next || now >= next)) { left = WHEEL_MAX_ATTEMPTS; next = null; }
-    return { attemptsLeft: left, maxAttempts: WHEEL_MAX_ATTEMPTS, nextAvailableAt: left > 0 ? null : next };
+    // bonusSpins: banked rank rewards, usable whenever the day's attempts are gone
+    return { attemptsLeft: left, maxAttempts: WHEEL_MAX_ATTEMPTS, nextAvailableAt: left > 0 ? null : next, bonusSpins: user.bonusSpins || 0 };
 }
 
 // What the account sees: codes not past expiry (used ones stay listed, marked used, for 30 days)
@@ -1147,17 +1194,23 @@ app.post('/api/wheel/spin', authUser, requireVerified, async (req, res) => {
         if (!user) return res.status(404).json({ error: "User not found" });
         const now = new Date();
         const status = wheelStatus(user, now);
-        if (status.attemptsLeft <= 0) {
+        const useBonus = status.attemptsLeft <= 0 && status.bonusSpins > 0;
+        if (status.attemptsLeft <= 0 && !useBonus) {
             return res.status(429).json({ error: "NO SPINS LEFT", code: "NO_SPINS", nextAvailableAt: status.nextAvailableAt });
         }
 
         const index = crypto.randomInt(WHEEL_SLICES.length);
         const slice = WHEEL_SLICES[index];
         const win = slice.type !== 'blank';
-        const left = status.attemptsLeft - 1;
-        // A win ends the cycle at once; so does using the last attempt
-        user.wheelAttemptsLeft = win ? 0 : left;
-        user.wheelNextAt = (win || left <= 0) ? new Date(now.getTime() + WHEEL_COOLDOWN_MS) : null;
+        if (useBonus) {
+            // A banked rank spin: spent on its own, the daily cycle and its cooldown stay as they are
+            user.bonusSpins = status.bonusSpins - 1;
+        } else {
+            const left = status.attemptsLeft - 1;
+            // A win ends the cycle at once; so does using the last attempt
+            user.wheelAttemptsLeft = win ? 0 : left;
+            user.wheelNextAt = (win || left <= 0) ? new Date(now.getTime() + WHEEL_COOLDOWN_MS) : null;
+        }
 
         const reward = { type: slice.type };
         if (slice.type === 'color') {
@@ -1657,11 +1710,22 @@ app.post('/api/submit-review', authLimiter, async (req, res) => {
         );
         if (!claimed) return res.status(409).json({ error: "This code has already been redeemed" });
 
+        // Signed in: the review carries the reviewer's rank at this moment, for the badge by the name
+        // (the name itself is free text, so the badge is the account's, read here from the session)
+        const reviewerId = optionalUserId(req);
+        let reviewerRank;
+        if (reviewerId) {
+            try {
+                const reviewer = await User.findById(reviewerId).select('achievements').lean();
+                if (reviewer) reviewerRank = rankFor(xpOf(reviewer.achievements)).rank;
+            } catch (e) { console.error("Reading reviewer rank failed:", e); }
+        }
+
         // $push rather than load-modify-save of the whole PC document: a concurrent admin edit of
         // this same PC then can't be overwritten by this write, or vice versa.
         const pushed = await PC.updateOne(
             { _id: ticket.pcId },
-            { $push: { reviews: { user, rating, text, date: new Date() } } }
+            { $push: { reviews: { user, rating, text, date: new Date(), ...(reviewerRank ? { rank: reviewerRank } : {}) } } }
         );
         if (!pushed.matchedCount) {
             // The PC was deleted between the check above and here — give the customer their code back
@@ -1672,7 +1736,6 @@ app.post('/api/submit-review', authLimiter, async (req, res) => {
         // The route stays open to guests — a mission code is the proof of purchase, not a login —
         // but when the browser does have a session, credit the account so 'field_report' becomes
         // earnable. The ticket is already marked used above, so this can't be farmed.
-        const reviewerId = optionalUserId(req);
         if (reviewerId) {
             try {
                 await User.updateOne({ _id: reviewerId }, { $inc: { reviewsWritten: 1 } });
