@@ -68,12 +68,29 @@ app.use(cors(corsOptions));
 app.use(express.json({ limit: '100kb' }));
 
 // --- 🛡️ SECURITY LAYER 3: RATE LIMITING ---
-const apiLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000, 
-    max: 100, 
+// The three public reads every page load makes (status, PCs, vote event) have their own, looser
+// bucket. They used to share the 100-per-15-minutes one with everything else, and one IP is often
+// many people — a household, an office, and above all a mobile network, where carriers put whole
+// neighbourhoods behind one address. A few dozen visitors browsing there would lock each other out
+// of the site, login included. Those reads are served from memory now (see the read caches), so a
+// generous limit costs little; it still stops a script hammering them.
+const PUBLIC_READS = new Set(['/status', '/drops', '/vote-event']);
+const isPublicRead = (req) => req.method === 'GET' && PUBLIC_READS.has(req.path);
+const publicReadLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 600,
+    standardHeaders: 'draft-8', legacyHeaders: false,
+    skip: (req) => !isPublicRead(req),
     message: { error: "⚠️ SYSTEM ALERT: Too many requests. Initiating cooldown sequence." }
 });
-app.use('/api/', apiLimiter);
+const apiLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 200,
+    standardHeaders: 'draft-8', legacyHeaders: false,
+    skip: isPublicRead,
+    message: { error: "⚠️ SYSTEM ALERT: Too many requests. Initiating cooldown sequence." }
+});
+app.use('/api/', publicReadLimiter, apiLimiter);
 
 const authLimiter = rateLimit({
     windowMs: 60 * 60 * 1000,
@@ -120,6 +137,33 @@ setInterval(() => {
         if (now >= entry.lockedUntil && (now - entry.windowStart) > LOGIN_LOCKOUT_MS) failedLogins.delete(key);
     }
 }, 10 * 60 * 1000).unref();
+
+// Password hashing brake. A bcrypt round at cost 12 is deliberately slow — on this dyno's small
+// CPU share likely around a second. A burst of logins/sign-ups (or someone scripting them from many
+// IPs, which the per-IP limiters above can't see) would run several at once and starve every other
+// request of CPU, so the whole site would crawl. At most BCRYPT_MAX_CONCURRENT run together, the
+// rest wait their turn; with too many already waiting the request is turned away at once with a
+// "busy" answer instead of joining a queue it would time out in.
+const BCRYPT_MAX_CONCURRENT = 2;
+const BCRYPT_MAX_WAITING = 20;
+let bcryptRunning = 0;
+const bcryptWaiting = [];
+class BcryptBusyError extends Error {}
+async function withBcrypt(fn) {
+    if (bcryptRunning >= BCRYPT_MAX_CONCURRENT) {
+        if (bcryptWaiting.length >= BCRYPT_MAX_WAITING) throw new BcryptBusyError();
+        await new Promise(resolve => bcryptWaiting.push(resolve));
+    } else {
+        bcryptRunning++;
+    }
+    try { return await fn(); }
+    finally {
+        // Hand the slot straight to the next in line (the count stays), or free it
+        const next = bcryptWaiting.shift();
+        if (next) next(); else bcryptRunning--;
+    }
+}
+const BUSY_ERROR = { error: "⚠️ SYSTEM BUSY: Too many sign-ins right now. Try again in a few seconds." };
 
 // --- 🛡️ SECURITY LAYER 4: PREVENT API CACHING (GHOST CACHE FIX) ---
 app.use('/api', (req, res, next) => {
@@ -215,7 +259,8 @@ const pcSchema = new mongoose.Schema({
     specs: { cpu: String, gpu: String, ram: String, ssd: String, mobo: String, psu: String, case: String },
     specDetails: { type: Map, of: String, default: {} },
     fps: [{ game: String, score: Number }],
-    reviews: [{ user: String, text: String, rating: Number, date: { type: Date, default: Date.now } }],
+    // rank: the reviewer's rank when they wrote it, if they were signed in (the badge by the name)
+    reviews: [{ user: String, text: String, rating: Number, rank: String, date: { type: Date, default: Date.now } }],
     votes: { type: Number, default: 0 },
     // Set on the PC a community vote turned into a regular listing (resolveVoteEvent) — the card
     // shows a COMMUNITY DROP badge for it.
@@ -245,6 +290,22 @@ const pcSchema = new mongoose.Schema({
         }
     }
 });
+
+// --- Read caches (in memory, one dyno) ---
+// GET /api/drops is on every page load and used to read and serialise every PC with all its reviews
+// each time; the maintenance check read SiteConfig on EVERY api request. Both now come from memory.
+// A cache is only safe if no write can leave it stale (stock, prices, a new review), so instead of
+// clearing it in each route that writes — seven of them, one inside the vote unlock — the models
+// clear it themselves, on every kind of write mongoose can make. The TTL is only a backstop for a
+// write made outside this process (someone editing the database by hand).
+const CACHE_TTL_MS = 30 * 1000;
+const WRITE_HOOKS = ['save', 'updateOne', 'updateMany', 'findOneAndUpdate', 'findOneAndDelete', 'findOneAndReplace', 'replaceOne', 'deleteOne', 'deleteMany', 'insertMany'];
+let dropsCache = null;      // { body: JSON string, at }
+let siteConfigCache = null; // { config: lean doc or null, at }
+const clearDropsCache = () => { dropsCache = null; };
+const clearSiteConfigCache = () => { siteConfigCache = null; };
+pcSchema.post(WRITE_HOOKS, clearDropsCache);
+
 const PC = mongoose.model('PC', pcSchema);
 
 const userSchema = new mongoose.Schema({
@@ -298,6 +359,11 @@ const userSchema = new mongoose.Schema({
     wheelAttemptsLeft: { type: Number, default: 3 },
     wheelNextAt: Date,
     unlockedColors: { type: [String], default: [] },
+    // Rank rewards (grantRankRewards): the ranks already paid out, and the bonus spins they gave that
+    // haven't been used yet — banked, spent only after the day's own attempts, and they never touch
+    // the daily cooldown
+    rankRewardsClaimed: { type: [String], default: [] },
+    bonusSpins: { type: Number, default: 0, min: 0 },
     // Discount codes won on the wheel. The order is a WhatsApp message, so the shop checks a code in
     // the admin panel and redeems it there (usedAt).
     coupons: [{ code: String, percent: Number, issuedAt: Date, expiresAt: Date, usedAt: Date }]
@@ -441,7 +507,20 @@ const siteConfigSchema = new mongoose.Schema({
         default: DEFAULT_VOTE_INFO_EL
     }
 });
+siteConfigSchema.post(WRITE_HOOKS, clearSiteConfigCache);
 const SiteConfig = mongoose.model('SiteConfig', siteConfigSchema);
+
+// The site config for READING (maintenance check, /api/status). Read-only: the admin routes that
+// change it still load the real document. null when the admin panel has never created one.
+async function getSiteConfig() {
+    if (siteConfigCache && Date.now() - siteConfigCache.at < CACHE_TTL_MS) return siteConfigCache.config;
+    // A full document turned into a plain object, not .lean(): lean skips the schema defaults, and an
+    // older config saved before a field existed (the maintenance message, say) would come back without it
+    const doc = await SiteConfig.findOne();
+    const config = doc ? doc.toObject() : null;
+    siteConfigCache = { config, at: Date.now() };
+    return config;
+}
 
 // --- 💶 PRICES ---
 // Reads the free-text prices the admin panel used to store ("340", "€340", "1.200", "449,99€").
@@ -549,14 +628,47 @@ const CLIENT_ACHIEVEMENT_IDS = new Set(ACHIEVEMENTS.filter(a => a.source === 'cl
 const LEGACY_ACHIEVEMENT_IDS = { login: 'recruited', cart: 'first_loot', vote: 'vote_caster' };
 
 // Ascending by minXp — rankFor() walks it backwards, so the order here is what defines the ladder.
+// What each rank gives, once, the first time the account reaches it (grantRankRewards): a badge (the
+// rank itself — shown on the profile and next to the name on reviews), and maybe an accent colour that
+// only a rank unlocks (never on the wheel) and bonus wheel spins. Decided and stored here, never by
+// the browser — the same reason the wheel is server-side.
 const RANKS = [
-    { id: 'recruit',    minXp: 0 },
-    { id: 'operative',  minXp: 100 },
-    { id: 'fieldAgent', minXp: 250 },
-    { id: 'specialist', minXp: 450 },
-    { id: 'eliteAgent', minXp: 700 },
-    { id: 'phantom',    minXp: 1000 }
+    { id: 'recruit',    minXp: 0,    rewards: {} },
+    { id: 'operative',  minXp: 100,  rewards: { spins: 1 } },
+    { id: 'fieldAgent', minXp: 250,  rewards: { color: 'ultraviolet' } },
+    { id: 'specialist', minXp: 450,  rewards: { spins: 2 } },
+    { id: 'eliteAgent', minXp: 700,  rewards: { color: 'arctic', spins: 1 } },
+    { id: 'phantom',    minXp: 1000, rewards: { color: 'phantom', spins: 3 } }
 ];
+// The ladder as the profile shows it (thresholds + rewards), sent with every profile so the frontend
+// never keeps its own copy of the numbers
+const RANK_LADDER = RANKS.map(r => ({ id: r.id, minXp: r.minXp, rewards: { ...r.rewards } }));
+
+const xpOf = (achievementIds) => (achievementIds || []).reduce((sum, id) => sum + (ACHIEVEMENT_XP.get(id) || 0), 0);
+
+// Hands out the rewards of every rank the account has reached but not been paid for yet, on the
+// document (the caller saves). Each rank pays once, ever — rankRewardsClaimed — so XP dropping and
+// rising again can't farm it. Returns what was granted just now, for the "rank up" notice.
+function grantRankRewards(user, xp) {
+    const claimed = new Set(user.rankRewardsClaimed || []);
+    const granted = [];
+    for (const r of RANKS) {
+        if (xp < r.minXp || claimed.has(r.id)) continue;
+        claimed.add(r.id);
+        const g = { rank: r.id };
+        if (r.rewards.color) {
+            if (!(user.unlockedColors || []).includes(r.rewards.color)) user.unlockedColors.push(r.rewards.color);
+            g.color = r.rewards.color;
+        }
+        if (r.rewards.spins) {
+            user.bonusSpins = (user.bonusSpins || 0) + r.rewards.spins;
+            g.spins = r.rewards.spins;
+        }
+        granted.push(g);
+    }
+    if (granted.length) user.rankRewardsClaimed = RANKS.map(r => r.id).filter(id => claimed.has(id));
+    return granted;
+}
 
 function rankFor(xp) {
     let current = RANKS[0];
@@ -615,13 +727,20 @@ async function syncAchievements(user) {
     const list = ACHIEVEMENTS.map(a => a.id).filter(id => earned.has(id));
     const changed = list.length !== (user.achievements || []).length
         || list.some((id, i) => user.achievements[i] !== id);
-    if (changed) {
-        user.achievements = list;
-        await user.save();
-    }
+    if (changed) user.achievements = list;
 
-    const xp = list.reduce((sum, id) => sum + (ACHIEVEMENT_XP.get(id) || 0), 0);
-    return { achievements: list, xp, ...rankFor(xp) };
+    const xp = xpOf(list);
+    // Accounts that were already past a rank before rewards existed get paid on their next load
+    const rankRewards = grantRankRewards(user, xp);
+    if (changed || rankRewards.length) await user.save();
+
+    return {
+        achievements: list, xp, ...rankFor(xp),
+        ranks: RANK_LADDER,
+        bonusSpins: user.bonusSpins || 0,
+        // Non-empty only on the request that paid them out — the frontend shows it once
+        rankRewards
+    };
 }
 
 // --- 📧 EMAIL DELIVERY (Mailjet Send API v3.1) ---
@@ -834,7 +953,7 @@ const isAdminRequest = (req) => {
 app.use('/api', async (req, res, next) => {
     if (req.path === '/status' || req.path === '/login' || isAdminRequest(req)) return next();
     try {
-        const config = await SiteConfig.findOne();
+        const config = await getSiteConfig();
         if (config?.maintenanceMode) {
             return res.status(503).json({ maintenance: true, message: config.maintenanceMessage });
         }
@@ -846,7 +965,7 @@ app.use('/api', async (req, res, next) => {
 
 // --- ROUTES ---
 app.get('/api/status', async (req, res) => {
-    const config = await SiteConfig.findOne();
+    const config = await getSiteConfig();
     res.json({
         maintenance: !!config?.maintenanceMode,
         message: config?.maintenanceMessage || null,
@@ -933,8 +1052,7 @@ app.post('/api/register', authLimiter, requireAuthConfig, async (req, res) => {
         // Checked explicitly — the unique index alone would surface as an unhelpful 500
         if (await User.findOne({ username })) return res.status(400).json({ error: "Username already taken" });
 
-        const salt = await bcrypt.genSalt(12);
-        const hashedPassword = await bcrypt.hash(password, salt);
+        const hashedPassword = await withBcrypt(() => bcrypt.hash(password, 12));
         const newUser = new User({ username, email, password: hashedPassword, subscribed });
         const rawVerifyToken = issueEmailVerification(newUser);
         const rawReportToken = issueSecurityReportToken(newUser);
@@ -952,7 +1070,10 @@ app.post('/api/register', authLimiter, requireAuthConfig, async (req, res) => {
 
         const token = jwt.sign({ id: newUser._id, username: newUser.username, tokenVersion: newUser.tokenVersion }, JWT_SECRET, { expiresIn: '30d' });
         res.json({ success: true, username: newUser.username, token, emailVerified: false });
-    } catch (e) { console.error("Register failed:", e); res.status(500).json({ error: "Error" }); }
+    } catch (e) {
+        if (e instanceof BcryptBusyError) return res.status(503).json(BUSY_ERROR);
+        console.error("Register failed:", e); res.status(500).json({ error: "Error" });
+    }
 });
 
 // Public — proving you control the emailed token IS the auth. Called by the frontend's own POST
@@ -1058,7 +1179,7 @@ app.post('/api/user-login', loginLimiter, requireAuthConfig, async (req, res) =>
 
         const user = await User.findOne({ username });
         if (!user) { recordFailedLogin(lockKey); return res.status(400).json({ error: "Invalid Credentials" }); }
-        const isMatch = await bcrypt.compare(password, user.password);
+        const isMatch = await withBcrypt(() => bcrypt.compare(password, user.password));
         if (isMatch) {
             // Checked only AFTER the password matches, deliberately: revealing "this account is
             // locked" to someone who doesn't actually hold the password would let a brute-force
@@ -1075,7 +1196,10 @@ app.post('/api/user-login', loginLimiter, requireAuthConfig, async (req, res) =>
             res.json({ success: true, username: user.username, token, emailVerified: user.emailVerified });
         }
         else { recordFailedLogin(lockKey); res.status(400).json({ error: "Invalid Credentials" }); }
-    } catch (e) { console.error("Login failed:", e); res.status(500).json({ error: "Server Error" }); }
+    } catch (e) {
+        if (e instanceof BcryptBusyError) return res.status(503).json(BUSY_ERROR);
+        console.error("Login failed:", e); res.status(500).json({ error: "Server Error" });
+    }
 });
 
 app.get('/api/me', authUser, requireVerified, async (req, res) => {
@@ -1111,7 +1235,8 @@ function wheelStatus(user, now = new Date()) {
     let left = Number.isFinite(user.wheelAttemptsLeft) ? user.wheelAttemptsLeft : WHEEL_MAX_ATTEMPTS;
     let next = user.wheelNextAt || null;
     if (left <= 0 && (!next || now >= next)) { left = WHEEL_MAX_ATTEMPTS; next = null; }
-    return { attemptsLeft: left, maxAttempts: WHEEL_MAX_ATTEMPTS, nextAvailableAt: left > 0 ? null : next };
+    // bonusSpins: banked rank rewards, usable whenever the day's attempts are gone
+    return { attemptsLeft: left, maxAttempts: WHEEL_MAX_ATTEMPTS, nextAvailableAt: left > 0 ? null : next, bonusSpins: user.bonusSpins || 0 };
 }
 
 // What the account sees: codes not past expiry (used ones stay listed, marked used, for 30 days)
@@ -1147,17 +1272,23 @@ app.post('/api/wheel/spin', authUser, requireVerified, async (req, res) => {
         if (!user) return res.status(404).json({ error: "User not found" });
         const now = new Date();
         const status = wheelStatus(user, now);
-        if (status.attemptsLeft <= 0) {
+        const useBonus = status.attemptsLeft <= 0 && status.bonusSpins > 0;
+        if (status.attemptsLeft <= 0 && !useBonus) {
             return res.status(429).json({ error: "NO SPINS LEFT", code: "NO_SPINS", nextAvailableAt: status.nextAvailableAt });
         }
 
         const index = crypto.randomInt(WHEEL_SLICES.length);
         const slice = WHEEL_SLICES[index];
         const win = slice.type !== 'blank';
-        const left = status.attemptsLeft - 1;
-        // A win ends the cycle at once; so does using the last attempt
-        user.wheelAttemptsLeft = win ? 0 : left;
-        user.wheelNextAt = (win || left <= 0) ? new Date(now.getTime() + WHEEL_COOLDOWN_MS) : null;
+        if (useBonus) {
+            // A banked rank spin: spent on its own, the daily cycle and its cooldown stay as they are
+            user.bonusSpins = status.bonusSpins - 1;
+        } else {
+            const left = status.attemptsLeft - 1;
+            // A win ends the cycle at once; so does using the last attempt
+            user.wheelAttemptsLeft = win ? 0 : left;
+            user.wheelNextAt = (win || left <= 0) ? new Date(now.getTime() + WHEEL_COOLDOWN_MS) : null;
+        }
 
         const reward = { type: slice.type };
         if (slice.type === 'color') {
@@ -1297,8 +1428,7 @@ app.post('/api/reset-password', authLimiter, async (req, res) => {
         const hashed = crypto.createHash('sha256').update(token).digest('hex');
         const user = await User.findOne({ resetToken: hashed, resetTokenExpiry: { $gt: Date.now() } });
         if (!user) return res.status(400).json({ error: "Invalid Token" });
-        const salt = await bcrypt.genSalt(12);
-        user.password = await bcrypt.hash(newPass, salt);
+        user.password = await withBcrypt(() => bcrypt.hash(newPass, 12));
         user.resetToken = undefined;
         user.resetTokenExpiry = undefined;
         // Invalidates every token issued before this moment — if the reset was prompted by a
@@ -1307,7 +1437,10 @@ app.post('/api/reset-password', authLimiter, async (req, res) => {
         user.tokenVersion = (user.tokenVersion || 0) + 1;
         await user.save();
         res.json({ success: true });
-    } catch (e) { res.status(500).json({ error: "Error" }); }
+    } catch (e) {
+        if (e instanceof BcryptBusyError) return res.status(503).json(BUSY_ERROR);
+        console.error("Reset password failed:", e); res.status(500).json({ error: "Error" });
+    }
 });
 
 app.get('/api/users/count', auth, async (req, res) => { const count = await User.countDocuments(); res.json({ count }); });
@@ -1357,7 +1490,14 @@ app.post('/api/login', loginLimiter, requireAuthConfig, (req, res) => {
 });
 
 app.get('/api/drops', async (req, res) => {
-    try { res.json(await PC.find()); }
+    try {
+        if (!dropsCache || Date.now() - dropsCache.at >= CACHE_TTL_MS) {
+            // Full documents (not lean), so schema defaults still fill fields older PCs never had;
+            // serialised once here, exactly as res.json() did, then reused until the next write
+            dropsCache = { body: JSON.stringify(await PC.find()), at: Date.now() };
+        }
+        res.type('application/json').send(dropsCache.body);
+    }
     catch (e) { console.error("Fetch drops failed:", e); res.status(500).json({ error: "Server Error" }); }
 });
 app.post('/api/drops', auth, async (req, res) => {
@@ -1657,11 +1797,22 @@ app.post('/api/submit-review', authLimiter, async (req, res) => {
         );
         if (!claimed) return res.status(409).json({ error: "This code has already been redeemed" });
 
+        // Signed in: the review carries the reviewer's rank at this moment, for the badge by the name
+        // (the name itself is free text, so the badge is the account's, read here from the session)
+        const reviewerId = optionalUserId(req);
+        let reviewerRank;
+        if (reviewerId) {
+            try {
+                const reviewer = await User.findById(reviewerId).select('achievements').lean();
+                if (reviewer) reviewerRank = rankFor(xpOf(reviewer.achievements)).rank;
+            } catch (e) { console.error("Reading reviewer rank failed:", e); }
+        }
+
         // $push rather than load-modify-save of the whole PC document: a concurrent admin edit of
         // this same PC then can't be overwritten by this write, or vice versa.
         const pushed = await PC.updateOne(
             { _id: ticket.pcId },
-            { $push: { reviews: { user, rating, text, date: new Date() } } }
+            { $push: { reviews: { user, rating, text, date: new Date(), ...(reviewerRank ? { rank: reviewerRank } : {}) } } }
         );
         if (!pushed.matchedCount) {
             // The PC was deleted between the check above and here — give the customer their code back
@@ -1672,7 +1823,6 @@ app.post('/api/submit-review', authLimiter, async (req, res) => {
         // The route stays open to guests — a mission code is the proof of purchase, not a login —
         // but when the browser does have a session, credit the account so 'field_report' becomes
         // earnable. The ticket is already marked used above, so this can't be farmed.
-        const reviewerId = optionalUserId(req);
         if (reviewerId) {
             try {
                 await User.updateOne({ _id: reviewerId }, { $inc: { reviewsWritten: 1 } });
