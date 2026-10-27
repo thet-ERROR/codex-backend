@@ -68,12 +68,29 @@ app.use(cors(corsOptions));
 app.use(express.json({ limit: '100kb' }));
 
 // --- 🛡️ SECURITY LAYER 3: RATE LIMITING ---
-const apiLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000, 
-    max: 100, 
+// The three public reads every page load makes (status, PCs, vote event) have their own, looser
+// bucket. They used to share the 100-per-15-minutes one with everything else, and one IP is often
+// many people — a household, an office, and above all a mobile network, where carriers put whole
+// neighbourhoods behind one address. A few dozen visitors browsing there would lock each other out
+// of the site, login included. Those reads are served from memory now (see the read caches), so a
+// generous limit costs little; it still stops a script hammering them.
+const PUBLIC_READS = new Set(['/status', '/drops', '/vote-event']);
+const isPublicRead = (req) => req.method === 'GET' && PUBLIC_READS.has(req.path);
+const publicReadLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 600,
+    standardHeaders: 'draft-8', legacyHeaders: false,
+    skip: (req) => !isPublicRead(req),
     message: { error: "⚠️ SYSTEM ALERT: Too many requests. Initiating cooldown sequence." }
 });
-app.use('/api/', apiLimiter);
+const apiLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 200,
+    standardHeaders: 'draft-8', legacyHeaders: false,
+    skip: isPublicRead,
+    message: { error: "⚠️ SYSTEM ALERT: Too many requests. Initiating cooldown sequence." }
+});
+app.use('/api/', publicReadLimiter, apiLimiter);
 
 const authLimiter = rateLimit({
     windowMs: 60 * 60 * 1000,
@@ -120,6 +137,33 @@ setInterval(() => {
         if (now >= entry.lockedUntil && (now - entry.windowStart) > LOGIN_LOCKOUT_MS) failedLogins.delete(key);
     }
 }, 10 * 60 * 1000).unref();
+
+// Password hashing brake. A bcrypt round at cost 12 is deliberately slow — on this dyno's small
+// CPU share likely around a second. A burst of logins/sign-ups (or someone scripting them from many
+// IPs, which the per-IP limiters above can't see) would run several at once and starve every other
+// request of CPU, so the whole site would crawl. At most BCRYPT_MAX_CONCURRENT run together, the
+// rest wait their turn; with too many already waiting the request is turned away at once with a
+// "busy" answer instead of joining a queue it would time out in.
+const BCRYPT_MAX_CONCURRENT = 2;
+const BCRYPT_MAX_WAITING = 20;
+let bcryptRunning = 0;
+const bcryptWaiting = [];
+class BcryptBusyError extends Error {}
+async function withBcrypt(fn) {
+    if (bcryptRunning >= BCRYPT_MAX_CONCURRENT) {
+        if (bcryptWaiting.length >= BCRYPT_MAX_WAITING) throw new BcryptBusyError();
+        await new Promise(resolve => bcryptWaiting.push(resolve));
+    } else {
+        bcryptRunning++;
+    }
+    try { return await fn(); }
+    finally {
+        // Hand the slot straight to the next in line (the count stays), or free it
+        const next = bcryptWaiting.shift();
+        if (next) next(); else bcryptRunning--;
+    }
+}
+const BUSY_ERROR = { error: "⚠️ SYSTEM BUSY: Too many sign-ins right now. Try again in a few seconds." };
 
 // --- 🛡️ SECURITY LAYER 4: PREVENT API CACHING (GHOST CACHE FIX) ---
 app.use('/api', (req, res, next) => {
@@ -246,6 +290,22 @@ const pcSchema = new mongoose.Schema({
         }
     }
 });
+
+// --- Read caches (in memory, one dyno) ---
+// GET /api/drops is on every page load and used to read and serialise every PC with all its reviews
+// each time; the maintenance check read SiteConfig on EVERY api request. Both now come from memory.
+// A cache is only safe if no write can leave it stale (stock, prices, a new review), so instead of
+// clearing it in each route that writes — seven of them, one inside the vote unlock — the models
+// clear it themselves, on every kind of write mongoose can make. The TTL is only a backstop for a
+// write made outside this process (someone editing the database by hand).
+const CACHE_TTL_MS = 30 * 1000;
+const WRITE_HOOKS = ['save', 'updateOne', 'updateMany', 'findOneAndUpdate', 'findOneAndDelete', 'findOneAndReplace', 'replaceOne', 'deleteOne', 'deleteMany', 'insertMany'];
+let dropsCache = null;      // { body: JSON string, at }
+let siteConfigCache = null; // { config: lean doc or null, at }
+const clearDropsCache = () => { dropsCache = null; };
+const clearSiteConfigCache = () => { siteConfigCache = null; };
+pcSchema.post(WRITE_HOOKS, clearDropsCache);
+
 const PC = mongoose.model('PC', pcSchema);
 
 const userSchema = new mongoose.Schema({
@@ -447,7 +507,20 @@ const siteConfigSchema = new mongoose.Schema({
         default: DEFAULT_VOTE_INFO_EL
     }
 });
+siteConfigSchema.post(WRITE_HOOKS, clearSiteConfigCache);
 const SiteConfig = mongoose.model('SiteConfig', siteConfigSchema);
+
+// The site config for READING (maintenance check, /api/status). Read-only: the admin routes that
+// change it still load the real document. null when the admin panel has never created one.
+async function getSiteConfig() {
+    if (siteConfigCache && Date.now() - siteConfigCache.at < CACHE_TTL_MS) return siteConfigCache.config;
+    // A full document turned into a plain object, not .lean(): lean skips the schema defaults, and an
+    // older config saved before a field existed (the maintenance message, say) would come back without it
+    const doc = await SiteConfig.findOne();
+    const config = doc ? doc.toObject() : null;
+    siteConfigCache = { config, at: Date.now() };
+    return config;
+}
 
 // --- 💶 PRICES ---
 // Reads the free-text prices the admin panel used to store ("340", "€340", "1.200", "449,99€").
@@ -880,7 +953,7 @@ const isAdminRequest = (req) => {
 app.use('/api', async (req, res, next) => {
     if (req.path === '/status' || req.path === '/login' || isAdminRequest(req)) return next();
     try {
-        const config = await SiteConfig.findOne();
+        const config = await getSiteConfig();
         if (config?.maintenanceMode) {
             return res.status(503).json({ maintenance: true, message: config.maintenanceMessage });
         }
@@ -892,7 +965,7 @@ app.use('/api', async (req, res, next) => {
 
 // --- ROUTES ---
 app.get('/api/status', async (req, res) => {
-    const config = await SiteConfig.findOne();
+    const config = await getSiteConfig();
     res.json({
         maintenance: !!config?.maintenanceMode,
         message: config?.maintenanceMessage || null,
@@ -979,8 +1052,7 @@ app.post('/api/register', authLimiter, requireAuthConfig, async (req, res) => {
         // Checked explicitly — the unique index alone would surface as an unhelpful 500
         if (await User.findOne({ username })) return res.status(400).json({ error: "Username already taken" });
 
-        const salt = await bcrypt.genSalt(12);
-        const hashedPassword = await bcrypt.hash(password, salt);
+        const hashedPassword = await withBcrypt(() => bcrypt.hash(password, 12));
         const newUser = new User({ username, email, password: hashedPassword, subscribed });
         const rawVerifyToken = issueEmailVerification(newUser);
         const rawReportToken = issueSecurityReportToken(newUser);
@@ -998,7 +1070,10 @@ app.post('/api/register', authLimiter, requireAuthConfig, async (req, res) => {
 
         const token = jwt.sign({ id: newUser._id, username: newUser.username, tokenVersion: newUser.tokenVersion }, JWT_SECRET, { expiresIn: '30d' });
         res.json({ success: true, username: newUser.username, token, emailVerified: false });
-    } catch (e) { console.error("Register failed:", e); res.status(500).json({ error: "Error" }); }
+    } catch (e) {
+        if (e instanceof BcryptBusyError) return res.status(503).json(BUSY_ERROR);
+        console.error("Register failed:", e); res.status(500).json({ error: "Error" });
+    }
 });
 
 // Public — proving you control the emailed token IS the auth. Called by the frontend's own POST
@@ -1104,7 +1179,7 @@ app.post('/api/user-login', loginLimiter, requireAuthConfig, async (req, res) =>
 
         const user = await User.findOne({ username });
         if (!user) { recordFailedLogin(lockKey); return res.status(400).json({ error: "Invalid Credentials" }); }
-        const isMatch = await bcrypt.compare(password, user.password);
+        const isMatch = await withBcrypt(() => bcrypt.compare(password, user.password));
         if (isMatch) {
             // Checked only AFTER the password matches, deliberately: revealing "this account is
             // locked" to someone who doesn't actually hold the password would let a brute-force
@@ -1121,7 +1196,10 @@ app.post('/api/user-login', loginLimiter, requireAuthConfig, async (req, res) =>
             res.json({ success: true, username: user.username, token, emailVerified: user.emailVerified });
         }
         else { recordFailedLogin(lockKey); res.status(400).json({ error: "Invalid Credentials" }); }
-    } catch (e) { console.error("Login failed:", e); res.status(500).json({ error: "Server Error" }); }
+    } catch (e) {
+        if (e instanceof BcryptBusyError) return res.status(503).json(BUSY_ERROR);
+        console.error("Login failed:", e); res.status(500).json({ error: "Server Error" });
+    }
 });
 
 app.get('/api/me', authUser, requireVerified, async (req, res) => {
@@ -1350,8 +1428,7 @@ app.post('/api/reset-password', authLimiter, async (req, res) => {
         const hashed = crypto.createHash('sha256').update(token).digest('hex');
         const user = await User.findOne({ resetToken: hashed, resetTokenExpiry: { $gt: Date.now() } });
         if (!user) return res.status(400).json({ error: "Invalid Token" });
-        const salt = await bcrypt.genSalt(12);
-        user.password = await bcrypt.hash(newPass, salt);
+        user.password = await withBcrypt(() => bcrypt.hash(newPass, 12));
         user.resetToken = undefined;
         user.resetTokenExpiry = undefined;
         // Invalidates every token issued before this moment — if the reset was prompted by a
@@ -1360,7 +1437,10 @@ app.post('/api/reset-password', authLimiter, async (req, res) => {
         user.tokenVersion = (user.tokenVersion || 0) + 1;
         await user.save();
         res.json({ success: true });
-    } catch (e) { res.status(500).json({ error: "Error" }); }
+    } catch (e) {
+        if (e instanceof BcryptBusyError) return res.status(503).json(BUSY_ERROR);
+        console.error("Reset password failed:", e); res.status(500).json({ error: "Error" });
+    }
 });
 
 app.get('/api/users/count', auth, async (req, res) => { const count = await User.countDocuments(); res.json({ count }); });
@@ -1410,7 +1490,14 @@ app.post('/api/login', loginLimiter, requireAuthConfig, (req, res) => {
 });
 
 app.get('/api/drops', async (req, res) => {
-    try { res.json(await PC.find()); }
+    try {
+        if (!dropsCache || Date.now() - dropsCache.at >= CACHE_TTL_MS) {
+            // Full documents (not lean), so schema defaults still fill fields older PCs never had;
+            // serialised once here, exactly as res.json() did, then reused until the next write
+            dropsCache = { body: JSON.stringify(await PC.find()), at: Date.now() };
+        }
+        res.type('application/json').send(dropsCache.body);
+    }
     catch (e) { console.error("Fetch drops failed:", e); res.status(500).json({ error: "Server Error" }); }
 });
 app.post('/api/drops', auth, async (req, res) => {
