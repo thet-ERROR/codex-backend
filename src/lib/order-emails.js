@@ -2,12 +2,12 @@
 // when it is cancelled, and to the shop (ORDERS_NOTIFY_EMAIL) for a new order and for a cancellation
 // by the customer. Sent in the background: a slow or failed email never holds up or fails the order.
 const { ORDERS_NOTIFY_EMAIL, ORDERS_CONTACT_EMAIL } = require('../config');
-const { ALLOWED_ORIGINS } = require('../security/cors');
+const { PRIMARY_ORIGIN } = require('../security/cors');
 const { sendMail, escHtml } = require('./email');
 
 const font = 'font-family:Arial,Helvetica,sans-serif;';
 const euros = (cents) => `${(Number(cents || 0) / 100).toLocaleString('el-GR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} €`;
-const siteBase = () => ALLOWED_ORIGINS[0] || 'https://codex-iota-nine.vercel.app';
+const siteBase = () => PRIMARY_ORIGIN || 'https://codex-iota-nine.vercel.app';
 // The customer's own order page (the storefront reads ?order= and ?t=)
 const orderLink = (order, token) => `${siteBase()}/?order=${encodeURIComponent(order.number)}&t=${encodeURIComponent(token)}`;
 
