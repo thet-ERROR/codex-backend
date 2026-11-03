@@ -58,7 +58,8 @@ const userSchema = new mongoose.Schema({
     bonusSpins: { type: Number, default: 0, min: 0 },
     // Discount codes won on the wheel. The order is a WhatsApp message, so the shop checks a code in
     // the admin panel and redeems it there (usedAt).
-    coupons: [{ code: String, percent: Number, issuedAt: Date, expiresAt: Date, usedAt: Date }]
+    // orderNumber: the order a code was spent on at checkout (empty when the admin redeemed it by hand)
+    coupons: [{ code: String, percent: Number, issuedAt: Date, expiresAt: Date, usedAt: Date, orderNumber: String }]
 });
 userSchema.index({ 'coupons.code': 1 }, { sparse: true });
 const User = mongoose.model('User', userSchema);

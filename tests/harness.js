@@ -26,7 +26,8 @@ const freePort = () => new Promise((resolve, reject) => {
     s.on('error', reject);
 });
 
-export async function startBackend() {
+// env: extra variables for this server only (e.g. ORDERS_LIVE)
+export async function startBackend({ env: extraEnv = {} } = {}) {
     const mongod = await MongoMemoryServer.create();
     const dbUri = mongod.getUri('codex-test');
     if (!/^mongodb:\/\/127\.0\.0\.1:\d+\//.test(dbUri)) {
@@ -49,7 +50,8 @@ export async function startBackend() {
             MAILJET_API_KEY: 'test', MAILJET_SECRET_KEY: 'test', EMAIL_FROM: 'noreply@test.invalid',
             PORT: String(port), NODE_ENV: 'test',
             MAIL_CAPTURE_FILE: mailFile,
-            NODE_OPTIONS: `--require ${path.join(HERE, 'mail-capture.cjs').replace(/\\/g, '/')}`
+            NODE_OPTIONS: `--require ${path.join(HERE, 'mail-capture.cjs').replace(/\\/g, '/')}`,
+            ...extraEnv
         },
         stdio: ['ignore', 'pipe', 'pipe']
     });

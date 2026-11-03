@@ -82,6 +82,7 @@ app.use(require('./src/routes/admin'));
 app.use(require('./src/routes/drops'));
 app.use(require('./src/routes/vote'));
 app.use(require('./src/routes/reviews'));
+app.use(require('./src/routes/orders'));
 app.use(require('./src/routes/newsletter'));
 
 // --- 🛡️ SECURITY LAYER 6: UNKNOWN ROUTES & UNCAUGHT ERRORS ---

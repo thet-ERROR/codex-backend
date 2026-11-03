@@ -1,7 +1,8 @@
 // Public status (maintenance, prices, diagnostics) and the admin's global settings.
 const { ALLOWED_ORIGINS, isOriginAllowed } = require('../security/cors');
 const { auth } = require('../security/auth');
-const { DEFAULT_VOTE_INFO_EN, DEFAULT_VOTE_INFO_EL, SiteConfig, getSiteConfig } = require('../models/site-config');
+const { ORDERS_LIVE } = require('../config');
+const { DEFAULT_VOTE_INFO_EN, DEFAULT_VOTE_INFO_EL, MIN_RETURN_DAYS, SiteConfig, getSiteConfig, orderSettings } = require('../models/site-config');
 const { MAILJET_API_KEY, MAILJET_SECRET_KEY, EMAIL_FROM } = require('../lib/email');
 
 const router = require('express').Router();
@@ -19,6 +20,9 @@ router.get('/api/status', async (req, res) => {
         // so a site where the admin panel has never been opened must still show sensible copy.
         voteInfoText: config?.voteInfoText || DEFAULT_VOTE_INFO_EN,
         voteInfoTextEl: config?.voteInfoTextEl || DEFAULT_VOTE_INFO_EL,
+        // The checkout reads these: whether orders are real yet (the DEMO notice), the return window,
+        // and the hand-delivery areas and map circle
+        orders: { live: ORDERS_LIVE, ...orderSettings(config) },
         // Diagnostics. Says whether the allowlist is configured at all and whether THIS caller's
         // origin is on it — the caller already knows its own origin, so nothing leaks, and a
         // silent CORS refusal becomes a one-request check instead of a log hunt.
@@ -60,6 +64,37 @@ router.post('/api/site-config', auth, async (req, res) => {
         }
         if (typeof voteInfoTextEl === 'string' && voteInfoTextEl.length <= 2000) {
             config.voteInfoTextEl = voteInfoTextEl;
+        }
+        // Order settings. Anything out of range is refused outright rather than clamped, so the admin
+        // sees their value wasn't taken instead of finding a different one saved.
+        const { returnDays, handDeliveryAreas, handDeliveryCenter, handDeliveryRadiusKm } = req.body;
+        if (returnDays !== undefined) {
+            const n = Number(returnDays);
+            if (!Number.isInteger(n) || n < MIN_RETURN_DAYS || n > 365) {
+                return res.status(400).json({ error: `Return window must be a whole number of days, ${MIN_RETURN_DAYS} to 365` });
+            }
+            config.returnDays = n;
+        }
+        if (handDeliveryAreas !== undefined) {
+            const areas = Array.isArray(handDeliveryAreas)
+                ? handDeliveryAreas.map(a => (typeof a === 'string' ? a.trim() : '')).filter(Boolean)
+                : null;
+            if (!areas || !areas.length || areas.length > 50 || areas.some(a => a.length > 60 || /[<>]/.test(a))) {
+                return res.status(400).json({ error: "Hand-delivery areas: 1 to 50 names, each up to 60 characters" });
+            }
+            config.handDeliveryAreas = [...new Set(areas)];
+        }
+        if (handDeliveryCenter !== undefined) {
+            const lat = Number(handDeliveryCenter?.lat), lng = Number(handDeliveryCenter?.lng);
+            if (!Number.isFinite(lat) || !Number.isFinite(lng) || Math.abs(lat) > 90 || Math.abs(lng) > 180) {
+                return res.status(400).json({ error: "Map centre must be a latitude and a longitude" });
+            }
+            config.handDeliveryCenter = { lat, lng };
+        }
+        if (handDeliveryRadiusKm !== undefined) {
+            const km = Number(handDeliveryRadiusKm);
+            if (!Number.isFinite(km) || km < 1 || km > 100) return res.status(400).json({ error: "Delivery radius must be 1 to 100 km" });
+            config.handDeliveryRadiusKm = km;
         }
         await config.save();
         res.json({ success: true, config });

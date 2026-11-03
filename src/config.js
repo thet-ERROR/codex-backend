@@ -10,4 +10,9 @@ if (!ADMIN_PASSWORD) {
     console.error("🚨 ADMIN_PASSWORD is not set. The admin panel cannot be used until it is.");
 }
 
-module.exports = { ADMIN_PASSWORD, JWT_SECRET, dbURI };
+// Orders are a DEMO until the business is registered: they are saved and work end to end, but are
+// marked demo, numbered DEMO-0001…, and the site says no real order is placed. Set ORDERS_LIVE=true
+// on Render the day real orders start — nothing else changes.
+const ORDERS_LIVE = process.env.ORDERS_LIVE === 'true';
+
+module.exports = { ADMIN_PASSWORD, JWT_SECRET, dbURI, ORDERS_LIVE };
