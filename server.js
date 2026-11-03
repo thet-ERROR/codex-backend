@@ -257,6 +257,10 @@ const pcSchema = new mongoose.Schema({
     images: [String], status: { type: String, default: 'available' }, category: { type: String, default: 'drop' },    
     multitasking: { type: Number, default: 0 },
     specs: { cpu: String, gpu: String, ram: String, ssd: String, mobo: String, psu: String, case: String },
+    // Benchmark scores for the CPU and the GPU (one scale for every PC, e.g. PassMark), typed in by
+    // the admin. The VS window turns two of them into a real "+X%" — a CPU's name alone can't say
+    // how fast it is. Unset = no percentage shown for that part.
+    benchScores: { cpu: { type: Number, min: 0 }, gpu: { type: Number, min: 0 } },
     specDetails: { type: Map, of: String, default: {} },
     fps: [{ game: String, score: Number }],
     // rank: the reviewer's rank when they wrote it, if they were signed in (the badge by the name)
