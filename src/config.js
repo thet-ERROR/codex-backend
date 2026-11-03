@@ -15,4 +15,12 @@ if (!ADMIN_PASSWORD) {
 // on Render the day real orders start — nothing else changes.
 const ORDERS_LIVE = process.env.ORDERS_LIVE === 'true';
 
-module.exports = { ADMIN_PASSWORD, JWT_SECRET, dbURI, ORDERS_LIVE };
+// Where the shop is told about new and cancelled orders, and the address customers' replies go to
+// (defaults to the same one). Set on Render, never in the code: the repository is public.
+const ORDERS_NOTIFY_EMAIL = (process.env.ORDERS_NOTIFY_EMAIL || '').trim();
+const ORDERS_CONTACT_EMAIL = (process.env.ORDERS_CONTACT_EMAIL || ORDERS_NOTIFY_EMAIL).trim();
+if (!ORDERS_NOTIFY_EMAIL) {
+    console.error("⚠️ ORDERS_NOTIFY_EMAIL is not set — orders still work, but nobody is emailed about a new one.");
+}
+
+module.exports = { ADMIN_PASSWORD, JWT_SECRET, dbURI, ORDERS_LIVE, ORDERS_NOTIFY_EMAIL, ORDERS_CONTACT_EMAIL };

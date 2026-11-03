@@ -7,7 +7,10 @@ const realFetch = global.fetch;
 global.fetch = async (url, options) => {
     if (String(url).startsWith('https://api.mailjet.com/')) {
         const message = JSON.parse(options.body).Messages[0];
-        fs.appendFileSync(process.env.MAIL_CAPTURE_FILE, JSON.stringify({ to: message.To[0].Email, subject: message.Subject, text: message.TextPart }) + '\n');
+        fs.appendFileSync(process.env.MAIL_CAPTURE_FILE, JSON.stringify({
+            to: message.To[0].Email, subject: message.Subject, text: message.TextPart,
+            html: message.HTMLPart || '', replyTo: message.ReplyTo ? message.ReplyTo.Email : null
+        }) + '\n');
         return new Response('{}', { status: 200 });
     }
     // Any other host is a bug in the test setup: nothing else should be called

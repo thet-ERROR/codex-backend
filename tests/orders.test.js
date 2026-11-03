@@ -403,3 +403,94 @@ describe('live orders', () => {
         } finally { await api.stop(); }
     });
 });
+
+describe('order emails', () => {
+    const SHOP = 'shop@test.invalid';
+    let api, admin, pc;
+    before(async () => {
+        api = await startBackend({ env: { ORDERS_NOTIFY_EMAIL: SHOP } });
+        admin = await api.adminToken();
+        pc = await shop(api, admin);
+    });
+    after(async () => { await api.stop(); });
+
+    // Emails go out after the answer, so wait for the one wanted
+    const waitForMail = async (match) => {
+        for (let i = 0; i < 60; i++) {
+            const m = api.mails().filter(match);
+            if (m.length) return m.at(-1);
+            await new Promise(r => setTimeout(r, 50));
+        }
+        throw new Error('expected email never arrived');
+    };
+    const count = (match) => api.mails().filter(match).length;
+
+    it('a new order emails the customer, in Greek, with the private link that opens it', async () => {
+        const r = await api.post('/orders', form([{ pcId: pc.rig, storage: 'ssd' }], { notes: 'Ring before, A & B' }));
+        const mail = await waitForMail(m => m.to === 'nikos@gmail.com' && m.subject.includes(r.body.number));
+        assert.equal(mail.subject, `[DEMO] Η παραγγελία ${r.body.number} καταχωρήθηκε`);
+        assert.match(mail.text, /Δοκιμαστική παραγγελία/);
+        assert.match(mail.text, /\+ 1TB SSD/);
+        assert.match(mail.text, /1\.080,00 €/);
+        assert.equal(mail.replyTo, SHOP, 'a reply from the customer must reach the shop');
+        const link = mail.text.match(/\?order=([A-Z0-9-]+)&t=([a-f0-9]{48})/);
+        assert.ok(link, 'the email carries the order page link');
+        assert.equal((await api.get(`/orders/${link[1]}?t=${link[2]}`)).status, 200);
+        assert.match(mail.html, /DEMO/);
+    });
+
+    it('the shop is told everything it needs, and nothing the customer typed can inject markup', async () => {
+        const r = await api.post('/orders', form([{ pcId: pc.plain }], { notes: 'Gate code 1 & 2' }));
+        const notice = await waitForMail(m => m.to === SHOP && m.subject.includes(r.body.number));
+        assert.match(notice.subject, /^\[DEMO\] Νέα παραγγελία DEMO-\d{4} — 500,00 €$/);
+        for (const piece of ['Nikos Papadopoulos', '6912345678', 'nikos@gmail.com', 'Egnatias 1, 54630 Thessaloniki', 'επισκέπτης', 'Απόδειξη', 'Gate code 1 & 2', 'PLAIN']) {
+            assert.ok(notice.text.includes(piece), `missing from the shop notice: ${piece}`);
+        }
+        assert.equal(notice.replyTo, 'nikos@gmail.com', 'the shop can reply straight to the customer');
+        assert.ok(notice.html.includes('Gate code 1 &amp; 2'), 'customer text must be escaped in the HTML');
+    });
+
+    it('an order placed in English is emailed in English', async () => {
+        const r = await api.post('/orders', form([{ pcId: pc.plain }], { lang: 'en', customer: { firstName: 'Anna', lastName: 'Smith', phone: '6900000002', email: 'anna@gmail.com' } }));
+        const mail = await waitForMail(m => m.to === 'anna@gmail.com');
+        assert.equal(mail.subject, `[DEMO] Order ${r.body.number} placed`);
+        assert.match(mail.text, /VIEW YOUR ORDER/);
+    });
+
+    it('a customer\'s cancellation emails them and the shop; the shop\'s own cancellation only the customer', async () => {
+        const mine = (await api.post('/orders', form([{ pcId: pc.plain }]))).body;
+        await waitForMail(m => m.to === SHOP && m.subject.includes(mine.number));
+        await api.post(`/orders/${mine.number}/cancel`, { t: mine.accessToken });
+        const toCustomer = await waitForMail(m => m.to === 'nikos@gmail.com' && m.subject === `Η παραγγελία ${mine.number} ακυρώθηκε`);
+        assert.match(toCustomer.text, /δεν χρειάζεται να κάνεις τίποτα/);
+        const toShop = await waitForMail(m => m.to === SHOP && m.subject.startsWith('[DEMO] Ακύρωση') && m.subject.includes(mine.number));
+        assert.match(toShop.text, /Ο πελάτης ακύρωσε/);
+
+        const theirs = (await api.post('/orders', form([{ pcId: pc.plain }]))).body;
+        await waitForMail(m => m.to === SHOP && m.subject.includes(theirs.number));
+        await api.post(`/admin/orders/${theirs.number}/cancel`, {}, { token: admin });
+        await waitForMail(m => m.to === 'nikos@gmail.com' && m.subject === `Η παραγγελία ${theirs.number} ακυρώθηκε`);
+        await new Promise(r => setTimeout(r, 300));
+        assert.equal(count(m => m.to === SHOP && m.subject.startsWith('[DEMO] Ακύρωση') && m.subject.includes(theirs.number)), 0);
+    });
+
+    it('a paid order that is cancelled tells the customer the money comes back', async () => {
+        const o = (await api.post('/orders', form([{ pcId: pc.plain }]))).body;
+        await api.post(`/admin/orders/${o.number}/status`, { status: 'paid' }, { token: admin });
+        await api.post(`/orders/${o.number}/cancel`, { t: o.accessToken });
+        const mail = await waitForMail(m => m.to === 'nikos@gmail.com' && m.subject.includes(o.number) && m.subject.includes('ακυρώθηκε'));
+        assert.match(mail.text, /επιστροφή των χρημάτων/);
+        const shopMail = await waitForMail(m => m.to === SHOP && m.subject.includes('Ακύρωση') && m.subject.includes(o.number));
+        assert.match(shopMail.text, /ΕΧΕΙ ΠΛΗΡΩΘΕΙ/);
+    });
+
+    it('the shop\'s notice warns when the phone has not turned up before', async () => {
+        const ghost = { firstName: 'Ghost', lastName: 'X', phone: '6977777777', email: 'ghost@gmail.com' };
+        const first = (await api.post('/orders', form([{ pcId: pc.plain }], { customer: ghost }))).body;
+        await api.post(`/admin/orders/${first.number}/cancel`, { reason: 'no_show' }, { token: admin });
+        const again = (await api.post('/orders', form([{ pcId: pc.plain }], { customer: { ...ghost, email: 'other@gmail.com' } }))).body;
+        const notice = await waitForMail(m => m.to === SHOP && m.subject.includes(again.number));
+        assert.match(notice.subject, /⚠$/);
+        assert.match(notice.text, /ΠΡΟΣΟΧΗ: 1 προηγούμενη/);
+    });
+});
