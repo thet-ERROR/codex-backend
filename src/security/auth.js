@@ -2,6 +2,7 @@
 const jwt = require('jsonwebtoken');
 const { JWT_SECRET } = require('../config');
 const User = require('../models/user');
+const { getAdminSecurity } = require('../models/admin-security');
 
 // Deliberately no fallback secret: a hardcoded default would let anyone mint valid tokens.
 // Auth routes fail closed with a clear 503 instead, so the public catalogue keeps working.
@@ -18,17 +19,23 @@ const bearerToken = (req) => {
 // Admin routes used to accept the raw password in a header on every single request, compared
 // with ===. That meant the shared secret travelled constantly, never expired, and the compare
 // leaked timing. Now the password is exchanged once at /api/login for a short-lived scoped JWT.
-const auth = (req, res, next) => {
+// The token also carries the admin's securityVersion (models/admin-security.js): turning two-factor
+// sign-in on or off bumps it, which ends every admin session started before. Tokens from before this
+// existed carry none and count as version 0.
+const auth = async (req, res, next) => {
     if (!JWT_SECRET) return res.status(503).json({ error: "SERVER MISCONFIGURED: authentication unavailable" });
     const token = bearerToken(req);
     if (!token) return res.status(401).json({ error: "⛔ ACCESS DENIED: ADMIN TOKEN REQUIRED" });
+    let decoded;
     try {
-        const decoded = jwt.verify(token, JWT_SECRET);
-        if (decoded.role !== 'admin') return res.status(403).json({ error: "⛔ ACCESS DENIED: NOT AN ADMIN TOKEN" });
-        next();
+        decoded = jwt.verify(token, JWT_SECRET);
     } catch (e) {
-        res.status(401).json({ error: "⛔ ACCESS DENIED: ADMIN SESSION EXPIRED" });
+        return res.status(401).json({ error: "⛔ ACCESS DENIED: ADMIN SESSION EXPIRED" });
     }
+    if (decoded.role !== 'admin') return res.status(403).json({ error: "⛔ ACCESS DENIED: NOT AN ADMIN TOKEN" });
+    const { securityVersion = 0 } = await getAdminSecurity();
+    if ((decoded.sv || 0) !== securityVersion) return res.status(401).json({ error: "⛔ ACCESS DENIED: ADMIN SESSION ENDED, SIGN IN AGAIN" });
+    next();
 };
 
 const authUser = async (req, res, next) => {
