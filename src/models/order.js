@@ -45,6 +45,8 @@ const orderSchema = new mongoose.Schema({
     coupon: { code: String, percent: Number },
     totalCents: Number,
     notes: String,
+    // The storefront's language when the order was placed: the customer's emails are written in it
+    lang: { type: String, enum: ['el', 'en'], default: 'el' },
 
     // What the customer agreed to, and when. termsVersion says which wording, if the terms change later.
     consent: { termsVersion: String, acceptedAt: Date, adultOrGuardian: Boolean },

@@ -22,7 +22,8 @@ if (!EMAIL_FROM) {
 // text-only exactly as before. TextPart is still sent alongside HTMLPart even when html is given:
 // Mailjet's spam scoring and any client that can't render HTML both fall back to it.
 // Throws on failure; callers already log and carry on without failing the request.
-async function sendMail({ to, subject, text, html }) {
+// `replyTo` is optional: where a customer's reply goes (the sender address is a no-reply one).
+async function sendMail({ to, subject, text, html, replyTo }) {
     if (!MAILJET_API_KEY || !MAILJET_SECRET_KEY || !EMAIL_FROM) {
         throw new Error('Email is not configured (MAILJET_API_KEY / MAILJET_SECRET_KEY / EMAIL_FROM missing)');
     }
@@ -42,7 +43,8 @@ async function sendMail({ to, subject, text, html }) {
                 To: [{ Email: to }],
                 Subject: subject,
                 TextPart: text,
-                ...(html ? { HTMLPart: html } : {})
+                ...(html ? { HTMLPart: html } : {}),
+                ...(replyTo ? { ReplyTo: { Email: replyTo } } : {})
             }]
         })
     });
@@ -127,4 +129,4 @@ async function sendVerificationEmail(user, rawVerifyToken, rawReportToken) {
     });
 }
 
-module.exports = { MAILJET_API_KEY, MAILJET_SECRET_KEY, EMAIL_FROM, sendMail, issueEmailVerification, issueSecurityReportToken, sendVerificationEmail };
+module.exports = { MAILJET_API_KEY, MAILJET_SECRET_KEY, EMAIL_FROM, sendMail, escHtml, issueEmailVerification, issueSecurityReportToken, sendVerificationEmail };

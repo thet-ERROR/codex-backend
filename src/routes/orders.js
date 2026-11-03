@@ -9,6 +9,7 @@ const PC = require('../models/pc');
 const User = require('../models/user');
 const { Order, nextOrderNumber } = require('../models/order');
 const { getSiteConfig, orderSettings } = require('../models/site-config');
+const { sendOrderPlaced, sendOrderCancelled } = require('../lib/order-emails');
 const {
     canCustomerCancel, adminCancellable, checkAdminTransition,
     validateCheckout, priceLine, orderableProblem, publicView
@@ -121,12 +122,16 @@ router.post('/api/orders', orderLimiter, async (req, res) => {
                 userId: user ? user._id : undefined,
                 customer: input.customer, delivery: input.delivery, invoice: input.invoice,
                 items: lines, subtotalCents, discountCents, coupon: coupon || undefined,
-                totalCents: subtotalCents - discountCents, notes: input.notes,
+                totalCents: subtotalCents - discountCents, notes: input.notes, lang: input.lang,
                 consent: { termsVersion: input.termsVersion, acceptedAt: now, adultOrGuardian: true },
                 accessTokenHash: hashToken(accessToken)
             });
             // The token is shown once, here (and in the confirmation email): the order page's link
             res.json({ success: true, number, demo: order.demo, accessToken, order: publicView(order) });
+            // After answering: the shop's notice warns if this phone or email didn't turn up before
+            Order.countDocuments({ noShow: true, $or: [{ 'customer.phone': order.customer.phone }, { 'customer.email': order.customer.email }] })
+                .catch(() => 0)
+                .then(priorNoShows => sendOrderPlaced(order, accessToken, { priorNoShows }));
         } catch (e) {
             await rollback();
             throw e;
@@ -182,6 +187,7 @@ router.post('/api/orders/:number/cancel', async (req, res) => {
         if (!cancelled) return res.status(409).json({ error: 'The order changed just now — reload and try again', code: 'CHANGED' });
         await releaseOrder(cancelled);
         res.json({ success: true, order: publicView(cancelled) });
+        sendOrderCancelled(cancelled, { byCustomer: true });
     } catch (e) { console.error('Cancel order failed:', e); res.status(500).json({ error: 'Server Error' }); }
 });
 
@@ -274,6 +280,7 @@ router.post('/api/admin/orders/:number/cancel', auth, async (req, res) => {
         if (!cancelled) return res.status(409).json({ error: 'The order changed just now — reload', code: 'CHANGED' });
         await releaseOrder(cancelled);
         res.json(cancelled);
+        sendOrderCancelled(cancelled, { byCustomer: false });
     } catch (e) { console.error('Cancel order (admin) failed:', e); res.status(500).json({ error: 'Server Error' }); }
 });
 

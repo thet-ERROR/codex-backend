@@ -107,6 +107,7 @@ function validateCheckout(body, { handDeliveryAreas }) {
         value: {
             customer, delivery, invoice, items, termsVersion,
             couponCode: t(b.couponCode, 20).toUpperCase(),
+            lang: b.lang === 'en' ? 'en' : 'el',
             notes: t(b.notes, 500).replace(/[<>]/g, '')
         }
     };
