@@ -37,4 +37,12 @@ const loginLimiter = rateLimit({
     message: { error: "⛔ ACCESS DENIED: Too many login attempts. Try again in 15 minutes." }
 });
 
-module.exports = { publicReadLimiter, apiLimiter, authLimiter, loginLimiter };
+// Placing an order holds stock, so a script placing fake orders could empty the shop. A real customer
+// places one or two; twenty an hour from one address is far past anything genuine.
+const orderLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000,
+    max: 20,
+    message: { error: "⛔ Too many orders from this connection. Try again later." }
+});
+
+module.exports = { publicReadLimiter, apiLimiter, authLimiter, loginLimiter, orderLimiter };

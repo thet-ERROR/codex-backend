@@ -91,4 +91,21 @@ const isAdminRequest = (req) => {
     }
 };
 
-module.exports = { requireAuthConfig, bearerToken, auth, authUser, optionalUserId, requireVerified, isAdminRequest };
+// The signed-in account behind a request, or null for a guest. Unlike optionalUserId it applies the
+// same checks as authUser (tokenVersion, so a session ended by a password reset is a guest here too)
+// and returns the full document — checkout spends the account's coupons and reads its email status.
+async function optionalSessionUser(req) {
+    if (!JWT_SECRET) return null;
+    const token = bearerToken(req);
+    if (!token) return null;
+    try {
+        const decoded = jwt.verify(token, JWT_SECRET);
+        if (decoded.role === 'admin' || !decoded.id) return null;
+        const user = await User.findById(decoded.id);
+        return user && user.tokenVersion === decoded.tokenVersion ? user : null;
+    } catch (e) {
+        return null;
+    }
+}
+
+module.exports = { requireAuthConfig, bearerToken, auth, authUser, optionalUserId, optionalSessionUser, requireVerified, isAdminRequest };

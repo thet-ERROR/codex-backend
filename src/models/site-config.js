@@ -6,6 +6,16 @@ const { CACHE_TTL_MS, WRITE_HOOKS, caches, clearSiteConfigCache } = require('./c
 const DEFAULT_VOTE_INFO_EN = "Community drops: the network votes to unlock a mystery PC.\n\n1. Voting opens on the date shown.\n2. Every signed-in agent with a verified email gets one vote.\n3. Reach the target before time runs out and the PC unlocks straight into Live Drops — signed-in members can order it first, until the timer would have ended; then it is open to everyone.\n4. If time runs out first, the PC still comes to Live Drops when voting closes.";
 const DEFAULT_VOTE_INFO_EL = "Κοινοτικά drops: η κοινότητα ψηφίζει για να ξεκλειδώσει ένα μυστηριώδες PC.\n\n1. Η ψηφοφορία ανοίγει την ημερομηνία που φαίνεται.\n2. Κάθε συνδεδεμένος πράκτορας με επιβεβαιωμένο email έχει μία ψήφο.\n3. Αν μαζευτούν οι ψήφοι πριν λήξει ο χρόνος, το PC ξεκλειδώνει και μπαίνει αμέσως στα Live Drops — με προτεραιότητα για τα συνδεδεμένα μέλη μέχρι να έληγε ο χρόνος, και μετά για όλους.\n4. Αν λήξει πρώτα ο χρόνος, το PC έρχεται κι αυτό στα Live Drops με το κλείσιμο της ψηφοφορίας.";
 
+// Order settings until the admin changes them. Hand delivery starts as Thessaloniki's urban area.
+const MIN_RETURN_DAYS = 14;
+const DEFAULT_RETURN_DAYS = 14;
+const DEFAULT_HAND_DELIVERY_AREAS = [
+    'Θεσσαλονίκη', 'Καλαμαριά', 'Πυλαία-Χορτιάτης', 'Νεάπολη-Συκιές',
+    'Παύλος Μελάς', 'Κορδελιό-Εύοσμος', 'Αμπελόκηποι-Μενεμένη', 'Θέρμη'
+];
+const DEFAULT_HAND_DELIVERY_CENTER = { lat: 40.6401, lng: 22.9444 };
+const DEFAULT_HAND_DELIVERY_RADIUS_KM = 10;
+
 const siteConfigSchema = new mongoose.Schema({
     maintenanceMode: { type: Boolean, default: false },
     maintenanceMessage: { type: String, default: "PHOENIX CODEX is currently undergoing scheduled maintenance. We'll be back online shortly." },
@@ -26,7 +36,18 @@ const siteConfigSchema = new mongoose.Schema({
     voteInfoTextEl: {
         type: String,
         default: DEFAULT_VOTE_INFO_EL
-    }
+    },
+    // --- Orders ---
+    // Days after delivery a customer can send a PC back. Never under 14: that is the legal minimum
+    // for a purchase made online, so the schema refuses less rather than trusting the form.
+    returnDays: { type: Number, default: DEFAULT_RETURN_DAYS, min: MIN_RETURN_DAYS },
+    // Hand delivery: the areas a customer can pick from, and the circle shaded on the map
+    handDeliveryAreas: { type: [String], default: () => [...DEFAULT_HAND_DELIVERY_AREAS] },
+    handDeliveryCenter: {
+        lat: { type: Number, default: DEFAULT_HAND_DELIVERY_CENTER.lat },
+        lng: { type: Number, default: DEFAULT_HAND_DELIVERY_CENTER.lng }
+    },
+    handDeliveryRadiusKm: { type: Number, default: DEFAULT_HAND_DELIVERY_RADIUS_KM, min: 1, max: 100 }
 });
 siteConfigSchema.post(WRITE_HOOKS, clearSiteConfigCache);
 const SiteConfig = mongoose.model('SiteConfig', siteConfigSchema);
@@ -43,4 +64,18 @@ async function getSiteConfig() {
     return config;
 }
 
-module.exports = { DEFAULT_VOTE_INFO_EN, DEFAULT_VOTE_INFO_EL, SiteConfig, getSiteConfig };
+// The order settings from a config read with getSiteConfig() — the defaults when the admin panel has
+// never saved one (getSiteConfig then answers null)
+function orderSettings(config) {
+    return {
+        returnDays: Math.max(MIN_RETURN_DAYS, config?.returnDays ?? DEFAULT_RETURN_DAYS),
+        handDeliveryAreas: config?.handDeliveryAreas?.length ? config.handDeliveryAreas : [...DEFAULT_HAND_DELIVERY_AREAS],
+        handDeliveryCenter: {
+            lat: config?.handDeliveryCenter?.lat ?? DEFAULT_HAND_DELIVERY_CENTER.lat,
+            lng: config?.handDeliveryCenter?.lng ?? DEFAULT_HAND_DELIVERY_CENTER.lng
+        },
+        handDeliveryRadiusKm: config?.handDeliveryRadiusKm ?? DEFAULT_HAND_DELIVERY_RADIUS_KM
+    };
+}
+
+module.exports = { DEFAULT_VOTE_INFO_EN, DEFAULT_VOTE_INFO_EL, MIN_RETURN_DAYS, SiteConfig, getSiteConfig, orderSettings };
