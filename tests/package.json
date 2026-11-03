@@ -1,0 +1,13 @@
+{
+  "name": "codex-backend-tests",
+  "version": "1.0.0",
+  "private": true,
+  "description": "API tests for server.js against an in-memory MongoDB. Kept apart from the server's own package.json so Render never installs them. Run: npm install, then npm test.",
+  "type": "module",
+  "scripts": {
+    "test": "node --test --test-concurrency=1"
+  },
+  "devDependencies": {
+    "mongodb-memory-server": "^10.1.4"
+  }
+}
