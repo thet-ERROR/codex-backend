@@ -2,17 +2,17 @@
 // list, status changes and cancellations.
 const crypto = require('crypto');
 const { ORDERS_LIVE } = require('../config');
-const { orderLimiter } = require('../security/rate-limits');
+const { orderLimiter, requestLimiter } = require('../security/rate-limits');
 const { auth, authUser, requireVerified, optionalSessionUser } = require('../security/auth');
 const { asString } = require('../lib/validation');
 const PC = require('../models/pc');
 const User = require('../models/user');
 const { Order, nextOrderNumber } = require('../models/order');
 const { getSiteConfig, orderSettings } = require('../models/site-config');
-const { sendOrderPlaced, sendOrderCancelled } = require('../lib/order-emails');
+const { sendOrderPlaced, sendOrderCancelled, sendRequestReceived } = require('../lib/order-emails');
 const {
     canCustomerCancel, adminCancellable, checkAdminTransition,
-    validateCheckout, priceLine, orderableProblem, publicView
+    validateCheckout, priceLine, orderableProblem, publicView, requestProblem, isOpen
 } = require('../lib/orders');
 
 const router = require('express').Router();
@@ -191,6 +191,37 @@ router.post('/api/orders/:number/cancel', async (req, res) => {
     } catch (e) { console.error('Cancel order failed:', e); res.status(500).json({ error: 'Server Error' }); }
 });
 
+// After delivery: a return (inside the return window) or a problem under the guarantee. Same access
+// as cancelling — the link's token, or the member who placed it. Recorded on the order so it can't be
+// lost in an inbox; the shop is emailed too.
+router.post('/api/orders/:number/request', requestLimiter, async (req, res) => {
+    try {
+        const order = await Order.findOne({ number: asString(req.params.number).toUpperCase() });
+        let allowed = tokenMatches(order, asString(req.body?.t));
+        if (!allowed && order?.userId) {
+            const user = await optionalSessionUser(req);
+            allowed = !!user && String(user._id) === String(order.userId);
+        }
+        if (!allowed) return res.status(404).json({ error: 'Order not found' });
+
+        const type = asString(req.body?.type);
+        const message = asString(req.body?.message).trim().slice(0, 1000);
+        if (message.length < 5) return res.status(400).json({ error: 'Tell us briefly what is wrong', field: 'message' });
+        const problem = requestProblem(order, type);
+        if (problem) return res.status(409).json({ error: problem, code: 'NOT_ALLOWED' });
+
+        // Conditional on there being no open request of this type: two taps at once make one
+        const updated = await Order.findOneAndUpdate(
+            { _id: order._id, requests: { $not: { $elemMatch: { type, handledAt: { $exists: false } } } } },
+            { $push: { requests: { type, message, createdAt: new Date() } } },
+            { new: true }
+        );
+        if (!updated) return res.status(409).json({ error: 'You already have an open request of this kind', code: 'NOT_ALLOWED' });
+        sendRequestReceived(updated, updated.requests.at(-1));
+        res.json({ success: true, order: publicView(updated) });
+    } catch (e) { console.error('Order request failed:', e); res.status(500).json({ error: 'Server Error' }); }
+});
+
 // --- the admin's side ---
 // Everything but the customer's link token
 const ADMIN_PROJECTION = '-accessTokenHash';
@@ -213,7 +244,7 @@ router.get('/api/admin/orders', auth, async (req, res) => {
         if (req.query.demo === 'false') q.demo = false;
         const orders = await Order.find(q).select(ADMIN_PROJECTION).sort({ createdAt: -1 }).limit(200);
         const noShows = await noShowCounts(orders);
-        res.json(orders.map(o => ({ ...o.toObject(), priorNoShows: noShows(o) })));
+        res.json(orders.map(o => ({ ...o.toObject(), priorNoShows: noShows(o), openRequests: (o.requests || []).filter(isOpen).length })));
     } catch (e) { console.error('List orders failed:', e); res.status(500).json({ error: 'Server Error' }); }
 });
 
@@ -222,7 +253,7 @@ router.get('/api/admin/orders/:number', auth, async (req, res) => {
         const order = await Order.findOne({ number: asString(req.params.number).toUpperCase() }).select(ADMIN_PROJECTION);
         if (!order) return res.status(404).json({ error: 'Order not found' });
         const noShows = await noShowCounts([order]);
-        res.json({ ...order.toObject(), priorNoShows: noShows(order) });
+        res.json({ ...order.toObject(), priorNoShows: noShows(order), openRequests: (order.requests || []).filter(isOpen).length });
     } catch (e) { console.error('Read order (admin) failed:', e); res.status(500).json({ error: 'Server Error' }); }
 });
 
@@ -282,6 +313,22 @@ router.post('/api/admin/orders/:number/cancel', auth, async (req, res) => {
         res.json(cancelled);
         sendOrderCancelled(cancelled, { byCustomer: false });
     } catch (e) { console.error('Cancel order (admin) failed:', e); res.status(500).json({ error: 'Server Error' }); }
+});
+
+// Marks a customer's request as handled (with an optional note for the record)
+router.post('/api/admin/orders/:number/requests/:id/handle', auth, async (req, res) => {
+    try {
+        const id = asString(req.params.id);
+        if (!/^[a-f0-9]{24}$/i.test(id)) return res.status(400).json({ error: 'Invalid request id' });
+        const note = asString(req.body?.note).trim().slice(0, 300);
+        const updated = await Order.findOneAndUpdate(
+            { number: asString(req.params.number).toUpperCase(), requests: { $elemMatch: { _id: id, handledAt: { $exists: false } } } },
+            { $set: { 'requests.$.handledAt': new Date(), 'requests.$.handledNote': note } },
+            { new: true, projection: ADMIN_PROJECTION }
+        );
+        if (!updated) return res.status(404).json({ error: 'Request not found or already handled' });
+        res.json({ ...updated.toObject(), openRequests: (updated.requests || []).filter(isOpen).length });
+    } catch (e) { console.error('Handle request failed:', e); res.status(500).json({ error: 'Server Error' }); }
 });
 
 module.exports = router;
