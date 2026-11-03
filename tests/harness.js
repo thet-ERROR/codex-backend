@@ -48,6 +48,7 @@ export async function startBackend({ env: extraEnv = {} } = {}) {
             ADMIN_PASSWORD,
             FRONTEND_URL: FRONTEND_ORIGIN,
             MAILJET_API_KEY: 'test', MAILJET_SECRET_KEY: 'test', EMAIL_FROM: 'noreply@test.invalid',
+            ADMIN_2FA_KEY: 'a1'.repeat(32),
             PORT: String(port), NODE_ENV: 'test',
             MAIL_CAPTURE_FILE: mailFile,
             NODE_OPTIONS: `--require ${path.join(HERE, 'mail-capture.cjs').replace(/\\/g, '/')}`,
