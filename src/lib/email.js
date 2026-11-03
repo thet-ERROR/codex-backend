@@ -1,5 +1,5 @@
 const crypto = require('crypto');
-const { ALLOWED_ORIGINS } = require('../security/cors');
+const { PRIMARY_ORIGIN } = require('../security/cors');
 
 // --- 📧 EMAIL DELIVERY (Mailjet Send API v3.1) ---
 // Render's free tier blocks outbound SMTP (ports 25/465/587) since Sept 2025, so nodemailer over
@@ -118,7 +118,7 @@ async function sendVerificationEmail(user, rawVerifyToken, rawReportToken) {
     // scanner never runs the page's JavaScript). Falls back to the API URL only if no frontend
     // origin is configured, so verification is never completely undeliverable. The report link
     // uses the identical reasoning and the identical protection.
-    const base = ALLOWED_ORIGINS[0] || `https://codex-backend-9kij.onrender.com`;
+    const base = PRIMARY_ORIGIN || `https://codex-backend-9kij.onrender.com`;
     const confirmLink = `${base}/?verify=${rawVerifyToken}`;
     const reportLink = `${base}/?report=${rawReportToken}`;
     await sendMail({

@@ -73,3 +73,48 @@ describe('the outer shell', () => {
         }
     });
 });
+
+describe('CORS for Vercel previews', () => {
+    // A pattern listed first on purpose: the email links must still use the real address
+    let preview;
+    before(async () => { preview = await startBackend({ env: { FRONTEND_URL: 'https://codex-*-phoenix-codex.vercel.app,https://codex-iota-nine.vercel.app' } }); });
+    after(async () => { await preview.stop(); });
+    const allows = async (origin) => (await preview.get('/status', { headers: { Origin: origin } })).headers.get('access-control-allow-origin') === origin;
+
+    it('lets in every preview deployment of the account, and the production site', async () => {
+        assert.equal(await allows('https://codex-lx35hnix4-phoenix-codex.vercel.app'), true);
+        assert.equal(await allows('https://codex-git-main-test-phoenix-codex.vercel.app'), true);
+        assert.equal(await allows('https://codex-iota-nine.vercel.app'), true);
+    });
+
+    it('does not let in look-alikes', async () => {
+        for (const origin of [
+            'https://codex-x.evil.com-phoenix-codex.vercel.app',  // a dot inside the wildcard
+            'https://codex-abc-phoenix-codex.vercel.app.evil.com', // the real suffix, then more
+            'https://evilcodex-abc-phoenix-codex.vercel.app',      // something before the prefix
+            'http://codex-abc-phoenix-codex.vercel.app',           // not https
+            'https://codex--phoenix-codex.vercel.app',             // the wildcard empty
+            'https://codex-abc-phoenix-codex.vercel.app:8443'      // another port
+        ]) {
+            assert.equal(await allows(origin), false, origin);
+        }
+    });
+
+    it('email links use the real site address, never the pattern', async () => {
+        const u = await preview.signUp('Previewer', { verify: false });
+        for (let i = 0; i < 40 && !preview.lastMailTo(u.email); i++) await new Promise(r => setTimeout(r, 50));
+        assert.match(preview.lastMailTo(u.email).text, /https:\/\/codex-iota-nine\.vercel\.app\/\?verify=/);
+    });
+});
+
+describe('CORS patterns that are refused', () => {
+    it('a wildcard anywhere but the first part of an https host is ignored', async () => {
+        const api2 = await startBackend({ env: { FRONTEND_URL: 'https://codex.*.app,https://*,http://codex-*-x.vercel.app' } });
+        try {
+            for (const origin of ['https://codex.evil.app', 'https://anything', 'http://codex-a-x.vercel.app']) {
+                const r = await api2.get('/status', { headers: { Origin: origin } });
+                assert.equal(r.headers.get('access-control-allow-origin'), null, origin);
+            }
+        } finally { await api2.stop(); }
+    });
+});
