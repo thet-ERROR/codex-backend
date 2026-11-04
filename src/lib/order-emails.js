@@ -176,6 +176,43 @@ function shopNotice(order, { event, priorNoShows = 0 }) {
     return { subject, text, html };
 }
 
+// A return or guarantee request: the shop gets the customer's words and how to reach them; the
+// customer gets a short acknowledgement in their language
+const REQUEST_COPY = {
+    el: { return: 'Αίτημα επιστροφής', problem: 'Αίτημα για πρόβλημα (εγγύηση)', ack: 'Λάβαμε το αίτημά σου και θα επικοινωνήσουμε μαζί σου σύντομα.', yours: 'ΤΟ ΜΗΝΥΜΑ ΣΟΥ' },
+    en: { return: 'Return request', problem: 'Problem report (guarantee)', ack: 'We have your request and will be in touch shortly.', yours: 'YOUR MESSAGE' }
+};
+function requestEmails(order, request) {
+    const shopLabel = REQUEST_COPY.el[request.type];
+    const delivered = order.deliveredAt ? new Date(order.deliveredAt).toLocaleDateString('el-GR') : '—';
+    const shopText = [
+        order.demo ? '[DEMO — δοκιμαστική, όχι πραγματική]' : '',
+        `${shopLabel} για την παραγγελία ${order.number}`, '',
+        `Πελάτης: ${order.customer?.firstName} ${order.customer?.lastName}`,
+        `Τηλέφωνο: ${order.customer?.phone}`, `Email: ${order.customer?.email}`,
+        `Παραδόθηκε: ${delivered}`,
+        request.type === 'return' && order.returnDeadline ? `Η επιστροφή ισχύει έως: ${new Date(order.returnDeadline).toLocaleDateString('el-GR')}` : '',
+        '', 'Μήνυμα πελάτη:', request.message, '', 'Κλείνει από το admin: Παραγγελίες → η παραγγελία → «Το χειρίστηκα».'
+    ].filter((l, i, a) => l !== '' || a[i - 1] !== '').join('\n').trim();
+    const shop = {
+        subject: `${order.demo ? '[DEMO] ' : ''}${shopLabel} — ${order.number}`,
+        text: shopText,
+        html: `<div style="${font}font-size:14px;line-height:1.6;white-space:pre-wrap;color:#111111;">${escHtml(shopText)}</div>`
+    };
+    const c = REQUEST_COPY[order.lang === 'en' ? 'en' : 'el'];
+    const base = copyFor(order);
+    const text = [c[request.type], `${base.number}: ${order.number}`, '', c.ack, '', `${c.yours}:`, request.message, '', `- ${base.sign}`].join('\n');
+    const html = shell(`
+${demoBanner(order, base)}
+<tr><td style="padding:8px 32px 8px 32px;text-align:center;">
+<div style="${font}font-size:20px;color:#ffffff;font-weight:bold;margin-bottom:6px;">${escHtml(c[request.type])}</div>
+<div style="${font}font-size:22px;letter-spacing:3px;color:#ffffff;font-weight:bold;margin:4px 0 8px;">${escHtml(order.number)}</div>
+<div style="${font}font-size:14px;color:#999999;line-height:1.6;">${escHtml(c.ack)}</div>
+</td></tr>
+<tr><td style="padding:12px 32px 28px 32px;${font}font-size:13px;color:#cccccc;line-height:1.6;"><div style="color:#888888;font-size:11px;letter-spacing:1px;margin-bottom:4px;">${escHtml(c.yours)}</div><div style="white-space:pre-wrap;">${escHtml(request.message)}</div></td></tr>`);
+    return { shop, customer: { subject: `${order.demo ? '[DEMO] ' : ''}${c[request.type]} — ${order.number}`, text, html } };
+}
+
 // --- sending (never awaited by the routes) ---
 const quietly = (label, p) => p.catch(e => console.error(`${label} email failed:`, e.message || e));
 
@@ -195,4 +232,12 @@ function sendOrderCancelled(order, { byCustomer }) {
     }
 }
 
-module.exports = { sendOrderPlaced, sendOrderCancelled, orderLink };
+function sendRequestReceived(order, request) {
+    const mail = requestEmails(order, request);
+    quietly(`Order ${order.number} request acknowledgement`, sendMail({ to: order.customer.email, replyTo: ORDERS_CONTACT_EMAIL || undefined, ...mail.customer }));
+    if (ORDERS_NOTIFY_EMAIL) {
+        quietly(`Order ${order.number} request notice`, sendMail({ to: ORDERS_NOTIFY_EMAIL, replyTo: order.customer.email, ...mail.shop }));
+    }
+}
+
+module.exports = { sendOrderPlaced, sendOrderCancelled, sendRequestReceived, orderLink };

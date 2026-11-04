@@ -152,8 +152,31 @@ function orderableProblem(pc, user) {
     return null;
 }
 
+// --- after delivery: returns and guarantee problems ---
+const WARRANTY_YEARS = 2; // the legal guarantee of conformity
+const MAX_OPEN_REQUESTS = 3;
+const warrantyUntil = (order) => {
+    if (!order.deliveredAt) return null;
+    const d = new Date(order.deliveredAt);
+    d.setFullYear(d.getFullYear() + WARRANTY_YEARS);
+    return d;
+};
+const isOpen = (r) => !r.handledAt;
+// Why a request of this type can't be made on this order right now, or null if it can. A return only
+// inside the return window; a problem for the whole guarantee. Only one open request of a type.
+function requestProblem(order, type, now = new Date()) {
+    if (!['return', 'problem'].includes(type)) return 'Unknown request type';
+    if (!order.deliveredAt || !['delivered', 'completed'].includes(order.status)) return 'Available once the order is delivered';
+    if (type === 'return' && !(order.returnDeadline && now <= new Date(order.returnDeadline))) return 'The return window has ended';
+    if (type === 'problem' && now > warrantyUntil(order)) return 'The guarantee period has ended';
+    if ((order.requests || []).some(r => r.type === type && isOpen(r))) return 'You already have an open request of this kind';
+    if ((order.requests || []).filter(isOpen).length >= MAX_OPEN_REQUESTS) return 'Too many open requests';
+    return null;
+}
+
 // --- what the customer's own order page shows ---
 function publicView(order) {
+    const now = new Date();
     return {
         number: order.number, demo: order.demo, status: order.status,
         history: (order.history || []).map(h => ({ status: h.status, at: h.at })),
@@ -162,11 +185,15 @@ function publicView(order) {
         items: order.items.map(i => ({ name: i.name, basePriceCents: i.basePriceCents, extras: i.extras, totalCents: i.totalCents, paint: i.paint })),
         subtotalCents: order.subtotalCents, discountCents: order.discountCents, coupon: order.coupon?.code ? order.coupon : null, totalCents: order.totalCents,
         createdAt: order.createdAt, deliveredAt: order.deliveredAt || null, returnDeadline: order.returnDeadline || null,
-        canCancel: canCustomerCancel(order)
+        canCancel: canCustomerCancel(order),
+        warrantyUntil: warrantyUntil(order),
+        canReturn: requestProblem(order, 'return', now) === null,
+        canReportProblem: requestProblem(order, 'problem', now) === null,
+        requests: (order.requests || []).map(r => ({ type: r.type, message: r.message, createdAt: r.createdAt, handled: !isOpen(r) }))
     };
 }
 
 module.exports = {
     STATUS_FLOW, canCustomerCancel, adminCancellable, checkAdminTransition,
-    validateCheckout, normalisePhone, priceLine, orderableProblem, publicView
+    validateCheckout, normalisePhone, priceLine, orderableProblem, publicView, requestProblem, isOpen
 };

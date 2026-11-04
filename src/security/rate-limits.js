@@ -45,4 +45,12 @@ const orderLimiter = rateLimit({
     message: { error: "⛔ Too many orders from this connection. Try again later." }
 });
 
-module.exports = { publicReadLimiter, apiLimiter, authLimiter, loginLimiter, orderLimiter };
+// A return or problem report emails the shop, so a script could flood the inbox. Its own allowance:
+// it must not eat into the one for placing orders, nor the other way round.
+const requestLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000,
+    max: 30,
+    message: { error: "⛔ Too many requests from this connection. Try again later." }
+});
+
+module.exports = { publicReadLimiter, apiLimiter, authLimiter, loginLimiter, orderLimiter, requestLimiter };

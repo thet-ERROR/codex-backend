@@ -63,7 +63,17 @@ const orderSchema = new mongoose.Schema({
     // Cancelled after it was paid: the money has to go back
     refundDue: { type: Boolean, default: false },
     // The customer never turned up or refused it. Later orders from the same phone or email say so.
-    noShow: { type: Boolean, default: false }
+    noShow: { type: Boolean, default: false },
+
+    // After delivery: 'return' (within the return window) and 'problem' (the 2-year legal guarantee).
+    // Kept on the order so nothing depends on an email being read; open until the admin handles it.
+    requests: [{
+        type: { type: String, enum: ['return', 'problem'] },
+        message: String,
+        createdAt: { type: Date, default: Date.now },
+        handledAt: Date,
+        handledNote: String
+    }]
 }, { timestamps: true });
 
 const Order = mongoose.model('Order', orderSchema);
