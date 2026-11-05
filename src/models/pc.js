@@ -18,8 +18,10 @@ const pcSchema = new mongoose.Schema({
     benchScores: { cpu: { type: Number, min: 0 }, gpu: { type: Number, min: 0 } },
     specDetails: { type: Map, of: String, default: {} },
     fps: [{ game: String, score: Number }],
-    // rank: the reviewer's rank when they wrote it, if they were signed in (the badge by the name)
-    reviews: [{ user: String, text: String, rating: Number, rank: String, date: { type: Date, default: Date.now } }],
+    // rank: the reviewer's rank when they wrote it, if they were signed in (the badge by the name).
+    // verified: written with a code from the box (the "✓ Verified purchase" badge) — a review the admin
+    // types in by hand never has it.
+    reviews: [{ user: String, text: String, rating: Number, rank: String, verified: Boolean, date: { type: Date, default: Date.now } }],
     votes: { type: Number, default: 0 },
     // Set on the PC a community vote turned into a regular listing (resolveVoteEvent) — the card
     // shows a COMMUNITY DROP badge for it.

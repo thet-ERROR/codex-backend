@@ -3,12 +3,18 @@ const { ALLOWED_ORIGINS, isOriginAllowed } = require('../security/cors');
 const { auth } = require('../security/auth');
 const { ORDERS_LIVE } = require('../config');
 const { DEFAULT_VOTE_INFO_EN, DEFAULT_VOTE_INFO_EL, MIN_RETURN_DAYS, SiteConfig, getSiteConfig, orderSettings } = require('../models/site-config');
+const { completeDueOrders, publicDeliveries } = require('../lib/order-lifecycle');
 const { MAILJET_API_KEY, MAILJET_SECRET_KEY, EMAIL_FROM } = require('../lib/email');
 
 const router = require('express').Router();
 
 router.get('/api/status', async (req, res) => {
     const config = await getSiteConfig();
+    // Every visit passes here, so this is where finished return windows get closed (at most once a
+    // minute; it never holds up the answer)
+    completeDueOrders({ throttle: true }).catch(e => console.error('Completing orders failed:', e));
+    let deliveries = null;
+    try { deliveries = await publicDeliveries(config); } catch (e) { console.error('Counting deliveries failed:', e); }
     res.json({
         maintenance: !!config?.maintenanceMode,
         message: config?.maintenanceMessage || null,
@@ -23,6 +29,9 @@ router.get('/api/status', async (req, res) => {
         // The checkout reads these: whether orders are real yet (the DEMO notice), the return window,
         // and the hand-delivery areas and map circle
         orders: { live: ORDERS_LIVE, ...orderSettings(config) },
+        // Completed real deliveries, for "N deliveries" by the reviews — null while it's off or below
+        // the admin's threshold
+        deliveries,
         // Diagnostics. Says whether the allowlist is configured at all and whether THIS caller's
         // origin is on it — the caller already knows its own origin, so nothing leaks, and a
         // silent CORS refusal becomes a one-request check instead of a log hunt.
@@ -95,6 +104,16 @@ router.post('/api/site-config', auth, async (req, res) => {
             const km = Number(handDeliveryRadiusKm);
             if (!Number.isFinite(km) || km < 1 || km > 100) return res.status(400).json({ error: "Delivery radius must be 1 to 100 km" });
             config.handDeliveryRadiusKm = km;
+        }
+        const { deliveriesBadgeOn, deliveriesBadgeMin } = req.body;
+        if (deliveriesBadgeOn !== undefined) {
+            if (typeof deliveriesBadgeOn !== 'boolean') return res.status(400).json({ error: "Deliveries badge: on or off" });
+            config.deliveriesBadgeOn = deliveriesBadgeOn;
+        }
+        if (deliveriesBadgeMin !== undefined) {
+            const n = Number(deliveriesBadgeMin);
+            if (!Number.isInteger(n) || n < 1 || n > 10000) return res.status(400).json({ error: "Deliveries badge threshold must be a whole number, 1 to 10000" });
+            config.deliveriesBadgeMin = n;
         }
         await config.save();
         res.json({ success: true, config });

@@ -6,6 +6,7 @@ const { asString } = require('../lib/validation');
 const PC = require('../models/pc');
 const User = require('../models/user');
 const ReviewTicket = require('../models/review-ticket');
+const { ticketWindow } = require('../lib/order-lifecycle');
 const { xpOf, rankFor } = require('../lib/achievements');
 
 const router = require('express').Router();
@@ -32,34 +33,36 @@ router.post('/api/activate-ticket/:id', auth, async (req, res) => {
     } catch(e) { res.status(500).json({ error: "Server error" }); }
 });
 
+// How a code's state is answered. The storefront reads valid / activated / expired / timeLeft.
+function codeAnswer(w) {
+    if (w.state === 'invalid') return { status: 404, body: { valid: false, msg: "❌ INVALID CODE" } };
+    if (w.state === 'used') return { status: 409, body: { valid: false, msg: "⚠️ ALREADY REDEEMED" } };
+    if (w.state === 'waiting') return { status: 200, body: { valid: true, activated: false, pcName: w.pcName } };
+    const expired = w.state === 'expired';
+    return { status: 200, body: { valid: true, activated: true, expired, pcName: w.pcName, ...(expired ? {} : { timeLeft: w.expiresAt - new Date() }) } };
+}
+
 // Read-only on purpose. This used to start the 48h validation window as a side effect of a GET
 // — meaning any automated client that fetches URLs (a chat app's link-preview bot, an uptime
 // monitor, a crawler, a browser prefetch) could silently burn a customer's window before they
 // ever typed the code in. GET now only ever reports status; POST /activate (below) is the only
-// thing that starts the clock, and only fires from an explicit user action in the frontend.
+// thing that changes anything, and only fires from an explicit user action in the frontend.
+// (Always 200 here: the storefront reads valid: false as "wrong code".)
 router.get('/api/check-code/:code', authLimiter, async (req, res) => {
     try {
-        const ticket = await ReviewTicket.findOne({ code: req.params.code });
-        if (!ticket) return res.json({ valid: false, msg: "❌ INVALID CODE" });
-        if (ticket.status === 'used') return res.json({ valid: false, msg: "⚠️ ALREADY REDEEMED" });
-        if (!ticket.firstScan) return res.json({ valid: true, activated: false, pcName: ticket.pcName });
-        const now = new Date(); const expiry = new Date(ticket.firstScan); expiry.setHours(expiry.getHours() + 48);
-        if (now > expiry) { return res.json({ valid: true, activated: true, expired: true, pcName: ticket.pcName }); }
-        res.json({ valid: true, activated: true, expired: false, pcName: ticket.pcName, timeLeft: expiry - now });
+        const ticket = await ReviewTicket.findOne({ code: asString(req.params.code) });
+        res.json(codeAnswer(await ticketWindow(ticket)).body);
     } catch(e) { console.error(e); res.status(500).json({ valid: false, msg: "SERVER ERROR" }); }
 });
 
-// The only route that starts the 48h window. Idempotent: calling it again after activation just
-// returns the already-running timer instead of resetting it, so a retried request can't extend it.
+// The customer entering the code. A code from an order's box marks that order delivered if the admin
+// hadn't yet (only whoever opened the box has it) and is open for reviews for two weeks from delivery;
+// a hand-made code starts its 48 hours. Idempotent: entering it again never resets or extends anything.
 router.post('/api/check-code/:code/activate', authLimiter, async (req, res) => {
     try {
-        const ticket = await ReviewTicket.findOne({ code: req.params.code });
-        if (!ticket) return res.status(404).json({ valid: false, msg: "❌ INVALID CODE" });
-        if (ticket.status === 'used') return res.status(409).json({ valid: false, msg: "⚠️ ALREADY REDEEMED" });
-        if (!ticket.firstScan) { ticket.firstScan = new Date(); ticket.status = 'active'; await ticket.save(); }
-        const now = new Date(); const expiry = new Date(ticket.firstScan); expiry.setHours(expiry.getHours() + 48);
-        if (now > expiry) return res.json({ valid: true, expired: true, pcName: ticket.pcName });
-        res.json({ valid: true, expired: false, pcName: ticket.pcName, timeLeft: expiry - now });
+        const ticket = await ReviewTicket.findOne({ code: asString(req.params.code) });
+        const a = codeAnswer(await ticketWindow(ticket, { activate: true }));
+        res.status(a.status).json(a.body);
     } catch(e) { console.error(e); res.status(500).json({ valid: false, msg: "SERVER ERROR" }); }
 });
 
@@ -85,16 +88,16 @@ router.post('/api/submit-review', authLimiter, async (req, res) => {
         }
 
         const ticket = await ReviewTicket.findOne({ code });
-        if (!ticket) return res.status(400).json({ error: "Invalid Ticket" });
+        if (!ticket || ticket.status === 'void') return res.status(400).json({ error: "Invalid Ticket" });
         // Previously any known code could be replayed to post unlimited reviews
         if (ticket.status === 'used') return res.status(409).json({ error: "This code has already been redeemed" });
 
-        // Same 48h window /api/check-code enforces — it was checked on read but never on write
-        if (ticket.firstScan) {
-            const expiry = new Date(ticket.firstScan);
-            expiry.setHours(expiry.getHours() + 48);
-            if (new Date() > expiry) return res.status(403).json({ error: "This code has expired" });
-        }
+        // The same window /api/check-code reports — checked here too, on the write. Submitting counts
+        // as entering the code, so an order code marks its box delivered here as well.
+        const w = await ticketWindow(ticket, { activate: true });
+        if (w.state === 'invalid') return res.status(400).json({ error: "Invalid Ticket" });
+        if (w.state === 'expired') return res.status(403).json({ error: "This code has expired" });
+        if (w.state !== 'open') return res.status(409).json({ error: "This code can't be used yet" });
 
         if (!await PC.exists({ _id: ticket.pcId })) return res.status(404).json({ error: "PC not found" });
 
@@ -123,7 +126,7 @@ router.post('/api/submit-review', authLimiter, async (req, res) => {
         // this same PC then can't be overwritten by this write, or vice versa.
         const pushed = await PC.updateOne(
             { _id: ticket.pcId },
-            { $push: { reviews: { user, rating, text, date: new Date(), ...(reviewerRank ? { rank: reviewerRank } : {}) } } }
+            { $push: { reviews: { user, rating, text, verified: true, date: new Date(), ...(reviewerRank ? { rank: reviewerRank } : {}) } } }
         );
         if (!pushed.matchedCount) {
             // The PC was deleted between the check above and here — give the customer their code back
