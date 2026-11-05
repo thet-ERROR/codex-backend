@@ -14,6 +14,7 @@ const {
     canCustomerCancel, adminCancellable, checkAdminTransition,
     validateCheckout, priceLine, orderableProblem, publicView, requestProblem, isOpen
 } = require('../lib/orders');
+const { deliveredFields, ensureOrderCodes, orderCodes, voidOrderCodes, completeDueOrders, orderStats } = require('../lib/order-lifecycle');
 
 const router = require('express').Router();
 
@@ -147,6 +148,7 @@ router.post('/api/orders', orderLimiter, async (req, res) => {
 // same answer, so the link can't be used to find out which order numbers exist.
 router.get('/api/orders/:number', async (req, res) => {
     try {
+        await completeDueOrders();
         const order = await Order.findOne({ number: asString(req.params.number).toUpperCase() });
         if (!tokenMatches(order, asString(req.query.t))) return res.status(404).json({ error: 'Order not found' });
         res.json(publicView(order));
@@ -156,6 +158,7 @@ router.get('/api/orders/:number', async (req, res) => {
 // A member's own orders, newest first
 router.get('/api/my-orders', authUser, requireVerified, async (req, res) => {
     try {
+        await completeDueOrders();
         const orders = await Order.find({ userId: req.userId }).sort({ createdAt: -1 }).limit(50);
         res.json(orders.map(publicView));
     } catch (e) { console.error('My orders failed:', e); res.status(500).json({ error: 'Server Error' }); }
@@ -186,6 +189,7 @@ router.post('/api/orders/:number/cancel', async (req, res) => {
         );
         if (!cancelled) return res.status(409).json({ error: 'The order changed just now — reload and try again', code: 'CHANGED' });
         await releaseOrder(cancelled);
+        await voidOrderCodes(cancelled);
         res.json({ success: true, order: publicView(cancelled) });
         sendOrderCancelled(cancelled, { byCustomer: true });
     } catch (e) { console.error('Cancel order failed:', e); res.status(500).json({ error: 'Server Error' }); }
@@ -235,8 +239,18 @@ async function noShowCounts(orders) {
     return (o) => flagged.filter(f => f.number !== o.number && (f.customer?.phone === o.customer?.phone || f.customer?.email === o.customer?.email)).length;
 }
 
+// The admin's own figures: deliveries, returns and problems (all time and the last 30 days), real
+// orders and DEMO ones apart. Never public.
+router.get('/api/admin/order-stats', auth, async (req, res) => {
+    try {
+        await completeDueOrders();
+        res.json(await orderStats());
+    } catch (e) { console.error('Order stats failed:', e); res.status(500).json({ error: 'Server Error' }); }
+});
+
 router.get('/api/admin/orders', auth, async (req, res) => {
     try {
+        await completeDueOrders();
         const q = {};
         const status = asString(req.query.status);
         if (status) q.status = status;
@@ -250,10 +264,11 @@ router.get('/api/admin/orders', auth, async (req, res) => {
 
 router.get('/api/admin/orders/:number', auth, async (req, res) => {
     try {
+        await completeDueOrders();
         const order = await Order.findOne({ number: asString(req.params.number).toUpperCase() }).select(ADMIN_PROJECTION);
         if (!order) return res.status(404).json({ error: 'Order not found' });
         const noShows = await noShowCounts([order]);
-        res.json({ ...order.toObject(), priorNoShows: noShows(order), openRequests: (order.requests || []).filter(isOpen).length });
+        res.json({ ...order.toObject(), priorNoShows: noShows(order), openRequests: (order.requests || []).filter(isOpen).length, reviewCodes: await orderCodes(order) });
     } catch (e) { console.error('Read order (admin) failed:', e); res.status(500).json({ error: 'Server Error' }); }
 });
 
@@ -275,11 +290,7 @@ router.post('/api/admin/orders/:number/status', auth, async (req, res) => {
         if (next === 'paid') set['payment.paidAt'] = now;
         const tracking = asString(req.body?.trackingNumber).trim().slice(0, 60);
         if (tracking) set['delivery.trackingNumber'] = tracking;
-        if (next === 'delivered') {
-            const { returnDays } = orderSettings(await getSiteConfig());
-            set.deliveredAt = now;
-            set.returnDeadline = new Date(now.getTime() + returnDays * 24 * 60 * 60 * 1000);
-        }
+        if (next === 'delivered') Object.assign(set, await deliveredFields(now));
         const note = asString(req.body?.note).trim().slice(0, 300);
         const updated = await Order.findOneAndUpdate(
             { _id: order._id, status: order.status },
@@ -287,7 +298,9 @@ router.post('/api/admin/orders/:number/status', auth, async (req, res) => {
             { new: true, projection: ADMIN_PROJECTION }
         );
         if (!updated) return res.status(409).json({ error: 'The order changed just now — reload', code: 'CHANGED' });
-        res.json(updated);
+        // From "packed" on, the box's review codes exist (made once), ready to print
+        const reviewCodes = await ensureOrderCodes(updated);
+        res.json({ ...updated.toObject(), reviewCodes });
     } catch (e) { console.error('Update order status failed:', e); res.status(500).json({ error: 'Server Error' }); }
 });
 
@@ -310,6 +323,7 @@ router.post('/api/admin/orders/:number/cancel', auth, async (req, res) => {
         );
         if (!cancelled) return res.status(409).json({ error: 'The order changed just now — reload', code: 'CHANGED' });
         await releaseOrder(cancelled);
+        await voidOrderCodes(cancelled);
         res.json(cancelled);
         sendOrderCancelled(cancelled, { byCustomer: false });
     } catch (e) { console.error('Cancel order (admin) failed:', e); res.status(500).json({ error: 'Server Error' }); }

@@ -15,6 +15,7 @@ const DEFAULT_HAND_DELIVERY_AREAS = [
 ];
 const DEFAULT_HAND_DELIVERY_CENTER = { lat: 40.6401, lng: 22.9444 };
 const DEFAULT_HAND_DELIVERY_RADIUS_KM = 10;
+const DEFAULT_DELIVERIES_BADGE_MIN = 10;
 
 const siteConfigSchema = new mongoose.Schema({
     maintenanceMode: { type: Boolean, default: false },
@@ -47,7 +48,11 @@ const siteConfigSchema = new mongoose.Schema({
         lat: { type: Number, default: DEFAULT_HAND_DELIVERY_CENTER.lat },
         lng: { type: Number, default: DEFAULT_HAND_DELIVERY_CENTER.lng }
     },
-    handDeliveryRadiusKm: { type: Number, default: DEFAULT_HAND_DELIVERY_RADIUS_KM, min: 1, max: 100 }
+    handDeliveryRadiusKm: { type: Number, default: DEFAULT_HAND_DELIVERY_RADIUS_KM, min: 1, max: 100 },
+    // "N deliveries" next to the reviews: shown only once N reaches the threshold ("1 delivery" says
+    // "we're new" more than anything), and the admin can switch it off altogether
+    deliveriesBadgeOn: { type: Boolean, default: true },
+    deliveriesBadgeMin: { type: Number, default: DEFAULT_DELIVERIES_BADGE_MIN, min: 1, max: 10000 }
 });
 siteConfigSchema.post(WRITE_HOOKS, clearSiteConfigCache);
 const SiteConfig = mongoose.model('SiteConfig', siteConfigSchema);
@@ -78,4 +83,10 @@ function orderSettings(config) {
     };
 }
 
-module.exports = { DEFAULT_VOTE_INFO_EN, DEFAULT_VOTE_INFO_EL, MIN_RETURN_DAYS, SiteConfig, getSiteConfig, orderSettings };
+// The "N deliveries" switch and threshold, with the defaults when nothing is saved
+const deliveriesBadge = (config) => ({
+    on: config?.deliveriesBadgeOn ?? true,
+    min: config?.deliveriesBadgeMin ?? DEFAULT_DELIVERIES_BADGE_MIN
+});
+
+module.exports = { DEFAULT_VOTE_INFO_EN, DEFAULT_VOTE_INFO_EL, MIN_RETURN_DAYS, SiteConfig, getSiteConfig, orderSettings, deliveriesBadge };
