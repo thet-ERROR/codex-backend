@@ -40,8 +40,13 @@ const ACHIEVEMENTS = [
     // Secrets: found by trying things in the terminal. Worth very little — they are for fun, not for rank.
     { id: 'nice_try',           xp: 10,  source: 'client' },
     { id: 'scorched_earth',     xp: 10,  source: 'client' },
-    { id: 'curious_agent',      xp: 10,  source: 'client' }
+    { id: 'curious_agent',      xp: 10,  source: 'client' },
+    // The Konami code. Pays a hidden accent colour (only ever shown to whoever found it), granted here
+    // on every sync so the colour can never exist on an account without the badge.
+    { id: 'cheat_code',         xp: 10,  source: 'client', color: 'cheatCode' }
 ];
+// Badges that pay an accent colour (not on the wheel, not from a rank)
+const ACHIEVEMENT_COLORS = ACHIEVEMENTS.filter(a => a.color).map(a => [a.id, a.color]);
 
 const ACHIEVEMENT_XP = new Map(ACHIEVEMENTS.map(a => [a.id, a.xp]));
 const CLIENT_ACHIEVEMENT_IDS = new Set(ACHIEVEMENTS.filter(a => a.source === 'client').map(a => a.id));
@@ -152,13 +157,25 @@ async function syncAchievements(user) {
         || list.some((id, i) => user.achievements[i] !== id);
     if (changed) user.achievements = list;
 
+    // A badge that pays a colour: the colour follows the badge
+    let colorsChanged = false;
+    for (const [id, color] of ACHIEVEMENT_COLORS) {
+        if (earned.has(id) && !(user.unlockedColors || []).includes(color)) {
+            if (!user.unlockedColors) user.unlockedColors = [];
+            user.unlockedColors.push(color);
+            colorsChanged = true;
+        }
+    }
+
     const xp = xpOf(list);
     // Accounts that were already past a rank before rewards existed get paid on their next load
     const rankRewards = grantRankRewards(user, xp);
-    if (changed || rankRewards.length) await user.save();
+    if (changed || colorsChanged || rankRewards.length) await user.save();
 
     return {
         achievements: list, xp, ...rankFor(xp),
+        // With every profile, so a colour a badge (or a rank) just paid is usable at once
+        unlockedColors: [...(user.unlockedColors || [])],
         ranks: RANK_LADDER,
         bonusSpins: user.bonusSpins || 0,
         // Non-empty only on the request that paid them out — the frontend shows it once

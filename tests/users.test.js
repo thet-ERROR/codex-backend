@@ -216,6 +216,20 @@ describe('profile, ranks and achievements', () => {
         assert.equal(again.body.xp, after.xp);
     });
 
+    it('the Konami badge pays its hidden colour, once, and /me keeps it', async () => {
+        const before = (await api.get('/me', { token: me.token })).body;
+        assert.ok(!before.unlockedColors.includes('cheatCode'), 'not before it is found');
+        const r = await api.post('/achievements', { id: 'cheat_code' }, { token: me.token });
+        assert.equal(r.status, 200);
+        assert.ok(r.body.unlockedColors.includes('cheatCode'), 'in the same reply');
+        assert.equal(r.body.xp - before.xp, 10);
+        await api.post('/achievements', { id: 'cheat_code' }, { token: me.token });
+        const after = (await api.get('/me', { token: me.token })).body;
+        assert.equal(after.unlockedColors.filter(c => c === 'cheatCode').length, 1);
+        // The colour cannot be reported on its own
+        assert.equal((await api.post('/achievements', { id: 'cheatCode' }, { token: me.token })).status, 400);
+    });
+
     it('reaching a rank pays its colour once, and /me shows it', async () => {
         const r = await api.get('/me', { token: me.token });
         assert.equal(r.body.rank, 'fieldAgent');
