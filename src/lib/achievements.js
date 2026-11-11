@@ -11,7 +11,7 @@ const Newsletter = require('../models/newsletter');
 //   source: 'client'  — a UI action the server genuinely cannot observe (a card flip, a wheel
 //                       spin). Still whitelisted by id so nothing can be invented, and worth
 //                       little XP each, so the honest half of the ladder is the one that counts:
-//                       all eight client badges together are worth less than one 'field_report'.
+//                       the everyday client badges together are worth about one 'field_report' (the terminal secrets add a token 10 each).
 //
 // XP lives here and nowhere else. The frontend renders whatever /api/me reports, so these numbers
 // can be retuned without shipping a matching frontend change.
@@ -36,7 +36,11 @@ const ACHIEVEMENTS = [
     { id: 'hacker',             xp: 25,  source: 'client' },
     { id: 'terminal_access',    xp: 25,  source: 'client' },
     { id: 'polyglot',           xp: 25,  source: 'client' },
-    { id: 'night_owl',          xp: 25,  source: 'client' }
+    { id: 'night_owl',          xp: 25,  source: 'client' },
+    // Secrets: found by trying things in the terminal. Worth very little — they are for fun, not for rank.
+    { id: 'nice_try',           xp: 10,  source: 'client' },
+    { id: 'scorched_earth',     xp: 10,  source: 'client' },
+    { id: 'curious_agent',      xp: 10,  source: 'client' }
 ];
 
 const ACHIEVEMENT_XP = new Map(ACHIEVEMENTS.map(a => [a.id, a.xp]));

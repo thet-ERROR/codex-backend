@@ -202,6 +202,20 @@ describe('profile, ranks and achievements', () => {
         assert.equal(ok.body.xp, 250);
     });
 
+    it('the terminal secrets can be reported, pay 10 XP each, and nothing else gets in', async () => {
+        const before = (await api.get('/me', { token: me.token })).body.xp;
+        for (const id of ['nice_try', 'scorched_earth', 'curious_agent']) {
+            const r = await api.post('/achievements', { id }, { token: me.token });
+            assert.equal(r.status, 200, id);
+            assert.ok(r.body.achievements.includes(id));
+        }
+        const after = (await api.get('/me', { token: me.token })).body;
+        assert.equal(after.xp - before, 30);
+        // Reporting the same one twice pays nothing more
+        const again = await api.post('/achievements', { id: 'nice_try' }, { token: me.token });
+        assert.equal(again.body.xp, after.xp);
+    });
+
     it('reaching a rank pays its colour once, and /me shows it', async () => {
         const r = await api.get('/me', { token: me.token });
         assert.equal(r.body.rank, 'fieldAgent');
