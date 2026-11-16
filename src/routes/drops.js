@@ -4,6 +4,7 @@ const { asString } = require('../lib/validation');
 const PC = require('../models/pc');
 const { CACHE_TTL_MS, caches } = require('../models/cache');
 const { normalizePriceFields } = require('../lib/prices');
+const { cleanHighlights } = require('../lib/highlights');
 
 const router = require('express').Router();
 
@@ -19,7 +20,13 @@ router.get('/api/drops', async (req, res) => {
     catch (e) { console.error("Fetch drops failed:", e); res.status(500).json({ error: "Server Error" }); }
 });
 router.post('/api/drops', auth, async (req, res) => {
-    try { const n = new PC(normalizePriceFields(req.body)); await n.save(); res.json(n); }
+    try {
+        const body = normalizePriceFields(req.body || {});
+        const hl = cleanHighlights(body.highlights);
+        if (hl.error) return res.status(400).json({ error: hl.error });
+        if (hl.value) body.highlights = hl.value;
+        const n = new PC(body); await n.save(); res.json(n);
+    }
     catch (e) { console.error("Create drop failed:", e); res.status(400).json({ error: "Invalid system data" }); }
 });
 router.put('/api/drops/:id', auth, async (req, res) => {
@@ -33,6 +40,9 @@ router.put('/api/drops/:id', auth, async (req, res) => {
         // overwritten by the admin's stale copy. Reviews on an existing PC are only ever changed
         // through the dedicated add/remove routes below, which touch one entry at a time.
         const { reviews, ...update } = normalizePriceFields(req.body || {});
+        const hl = cleanHighlights(update.highlights);
+        if (hl.error) return res.status(400).json({ error: hl.error });
+        if (hl.value) update.highlights = hl.value;
         const u = await PC.findByIdAndUpdate(req.params.id, update, { new: true, runValidators: true });
         if (!u) return res.status(404).json({ error: "PC not found" });
         res.json(u);
