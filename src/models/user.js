@@ -50,7 +50,11 @@ const userSchema = new mongoose.Schema({
     // from devtools, and a coupon is worth real money. See POST /api/wheel/spin.
     wheelAttemptsLeft: { type: Number, default: 3 },
     wheelNextAt: Date,
+    // The accent colours won before the themes (Nov 2026). Kept as they are, never rewritten: the themes
+    // they open are worked out from them (src/lib/themes.js).
     unlockedColors: { type: [String], default: [] },
+    // Themes won since (wheel, rank, Konami). The two free ones are never stored.
+    unlockedThemes: { type: [String], default: [] },
     // Rank rewards (grantRankRewards): the ranks already paid out, and the bonus spins they gave that
     // haven't been used yet — banked, spent only after the day's own attempts, and they never touch
     // the daily cooldown

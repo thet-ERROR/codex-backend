@@ -4,9 +4,11 @@ const User = require('../models/user');
 // --- DAILY WHEEL + COUPONS ---
 // Same slice order as WHEEL slices in the frontend (js/modules/wheel.js) — the server answers with an
 // index and the wheel animates to it.
+// One theme slice (Inferno, the wheel's theme), four coupons, three blanks. The order is what the
+// frontend draws (js/modules/wheel.js), so the two lists change together.
 const WHEEL_SLICES = [
-    { type: 'blank' }, { type: 'color', id: 'cyberGold' }, { type: 'coupon' }, { type: 'color', id: 'toxicOrange' },
-    { type: 'blank' }, { type: 'color', id: 'neonPink' }, { type: 'coupon' }, { type: 'color', id: 'matrixGreen' }
+    { type: 'blank' }, { type: 'theme', id: 'inferno' }, { type: 'coupon' }, { type: 'blank' },
+    { type: 'coupon' }, { type: 'blank' }, { type: 'coupon' }, { type: 'coupon' }
 ];
 const WHEEL_MAX_ATTEMPTS = 3;
 const WHEEL_COOLDOWN_MS = 24 * 60 * 60 * 1000;
