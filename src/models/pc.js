@@ -22,6 +22,12 @@ const pcSchema = new mongoose.Schema({
     // verified: written with a code from the box (the "✓ Verified purchase" badge) — a review the admin
     // types in by hand never has it.
     reviews: [{ user: String, text: String, rating: Number, rank: String, verified: Boolean, date: { type: Date, default: Date.now } }],
+    // Strong points (lib/highlights.js): up to three short lines per language, the admin's own words, shown by
+    // the storefront's assistant when it recommends this PC
+    highlights: {
+        el: { type: [String], default: [] },
+        en: { type: [String], default: [] }
+    },
     votes: { type: Number, default: 0 },
     // Set on the PC a community vote turned into a regular listing (resolveVoteEvent) — the card
     // shows a COMMUNITY DROP badge for it.
