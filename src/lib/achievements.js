@@ -1,5 +1,6 @@
 const User = require('../models/user');
 const Newsletter = require('../models/newsletter');
+const { themesFor, grantTheme } = require('./themes');
 
 // --- 🏅 ACHIEVEMENTS, XP & RANKS ---
 // The previous version took the client at its word: POST /api/achievements accepted any string as
@@ -41,12 +42,12 @@ const ACHIEVEMENTS = [
     { id: 'nice_try',           xp: 10,  source: 'client' },
     { id: 'scorched_earth',     xp: 10,  source: 'client' },
     { id: 'curious_agent',      xp: 10,  source: 'client' },
-    // The Konami code. Pays a hidden accent colour (only ever shown to whoever found it), granted here
-    // on every sync so the colour can never exist on an account without the badge.
-    { id: 'cheat_code',         xp: 10,  source: 'client', color: 'cheatCode' }
+    // The Konami code. Pays the hidden Phantom theme (only ever shown to whoever found it), granted here
+    // on every sync so the theme can never exist on an account without the badge.
+    { id: 'cheat_code',         xp: 10,  source: 'client', theme: 'phantom' }
 ];
-// Badges that pay an accent colour (not on the wheel, not from a rank)
-const ACHIEVEMENT_COLORS = ACHIEVEMENTS.filter(a => a.color).map(a => [a.id, a.color]);
+// Badges that pay a theme (not on the wheel, not from a rank)
+const ACHIEVEMENT_THEMES = ACHIEVEMENTS.filter(a => a.theme).map(a => [a.id, a.theme]);
 
 const ACHIEVEMENT_XP = new Map(ACHIEVEMENTS.map(a => [a.id, a.xp]));
 const CLIENT_ACHIEVEMENT_IDS = new Set(ACHIEVEMENTS.filter(a => a.source === 'client').map(a => a.id));
@@ -63,10 +64,10 @@ const LEGACY_ACHIEVEMENT_IDS = { login: 'recruited', cart: 'first_loot', vote: '
 const RANKS = [
     { id: 'recruit',    minXp: 0,    rewards: {} },
     { id: 'operative',  minXp: 100,  rewards: { spins: 1 } },
-    { id: 'fieldAgent', minXp: 250,  rewards: { color: 'ultraviolet' } },
+    { id: 'fieldAgent', minXp: 250,  rewards: { spins: 1 } },
     { id: 'specialist', minXp: 450,  rewards: { spins: 2 } },
-    { id: 'eliteAgent', minXp: 700,  rewards: { color: 'arctic', spins: 1 } },
-    { id: 'phantom',    minXp: 1000, rewards: { color: 'phantom', spins: 3 } }
+    { id: 'eliteAgent', minXp: 700,  rewards: { theme: 'arctic', spins: 1 } },
+    { id: 'phantom',    minXp: 1000, rewards: { spins: 3 } }
 ];
 // The ladder as the profile shows it (thresholds + rewards), sent with every profile so the frontend
 // never keeps its own copy of the numbers
@@ -84,9 +85,9 @@ function grantRankRewards(user, xp) {
         if (xp < r.minXp || claimed.has(r.id)) continue;
         claimed.add(r.id);
         const g = { rank: r.id };
-        if (r.rewards.color) {
-            if (!(user.unlockedColors || []).includes(r.rewards.color)) user.unlockedColors.push(r.rewards.color);
-            g.color = r.rewards.color;
+        if (r.rewards.theme) {
+            grantTheme(user, r.rewards.theme);
+            g.theme = r.rewards.theme;
         }
         if (r.rewards.spins) {
             user.bonusSpins = (user.bonusSpins || 0) + r.rewards.spins;
@@ -157,25 +158,23 @@ async function syncAchievements(user) {
         || list.some((id, i) => user.achievements[i] !== id);
     if (changed) user.achievements = list;
 
-    // A badge that pays a colour: the colour follows the badge
-    let colorsChanged = false;
-    for (const [id, color] of ACHIEVEMENT_COLORS) {
-        if (earned.has(id) && !(user.unlockedColors || []).includes(color)) {
-            if (!user.unlockedColors) user.unlockedColors = [];
-            user.unlockedColors.push(color);
-            colorsChanged = true;
-        }
+    // A badge that pays a theme: the theme follows the badge
+    let themesChanged = false;
+    for (const [id, theme] of ACHIEVEMENT_THEMES) {
+        if (earned.has(id) && grantTheme(user, theme)) themesChanged = true;
     }
 
     const xp = xpOf(list);
     // Accounts that were already past a rank before rewards existed get paid on their next load
     const rankRewards = grantRankRewards(user, xp);
-    if (changed || colorsChanged || rankRewards.length) await user.save();
+    if (changed || themesChanged || rankRewards.length) await user.save();
 
     return {
         achievements: list, xp, ...rankFor(xp),
-        // With every profile, so a colour a badge (or a rank) just paid is usable at once
+        // With every profile, so a theme a badge (or a rank) just paid is usable at once. The old colour
+        // list goes along too, for a frontend from before the themes.
         unlockedColors: [...(user.unlockedColors || [])],
+        unlockedThemes: themesFor(user),
         ranks: RANK_LADDER,
         bonusSpins: user.bonusSpins || 0,
         // Non-empty only on the request that paid them out — the frontend shows it once
@@ -183,4 +182,4 @@ async function syncAchievements(user) {
     };
 }
 
-module.exports = { CLIENT_ACHIEVEMENT_IDS, xpOf, rankFor, syncAchievements };
+module.exports = { CLIENT_ACHIEVEMENT_IDS, xpOf, rankFor, syncAchievements, grantRankRewards };

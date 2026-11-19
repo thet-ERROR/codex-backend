@@ -2,6 +2,7 @@
 const crypto = require('crypto');
 const { auth, authUser, requireVerified } = require('../security/auth');
 const User = require('../models/user');
+const { themesFor, grantTheme } = require('../lib/themes');
 const { WHEEL_SLICES, WHEEL_COOLDOWN_MS, COUPON_PERCENT, COUPON_DAYS, spinsInFlight, wheelStatus, couponsFor, newCouponCode } = require('../lib/wheel');
 
 const router = require('express').Router();
@@ -10,7 +11,7 @@ router.get('/api/wheel', authUser, requireVerified, async (req, res) => {
     try {
         const user = await User.findById(req.userId);
         if (!user) return res.status(404).json({ error: "User not found" });
-        res.json({ ...wheelStatus(user), coupons: couponsFor(user), unlockedColors: user.unlockedColors || [] });
+        res.json({ ...wheelStatus(user), coupons: couponsFor(user), unlockedColors: user.unlockedColors || [], unlockedThemes: themesFor(user) });
     } catch (e) { console.error("Wheel status failed:", e); res.status(500).json({ error: "Server Error" }); }
 });
 
@@ -41,10 +42,9 @@ router.post('/api/wheel/spin', authUser, requireVerified, async (req, res) => {
         }
 
         const reward = { type: slice.type };
-        if (slice.type === 'color') {
+        if (slice.type === 'theme') {
             reward.id = slice.id;
-            reward.alreadyUnlocked = (user.unlockedColors || []).includes(slice.id);
-            if (!reward.alreadyUnlocked) user.unlockedColors.push(slice.id);
+            reward.alreadyUnlocked = !grantTheme(user, slice.id);
         } else if (slice.type === 'coupon') {
             const coupon = { code: await newCouponCode(), percent: COUPON_PERCENT, issuedAt: now, expiresAt: new Date(now.getTime() + COUPON_DAYS * 24 * 60 * 60 * 1000) };
             user.coupons.push(coupon);
@@ -53,7 +53,7 @@ router.post('/api/wheel/spin', authUser, requireVerified, async (req, res) => {
         await user.save();
 
         const after = wheelStatus(user, now);
-        res.json({ index, reward, ...after, coupons: couponsFor(user, now), unlockedColors: user.unlockedColors });
+        res.json({ index, reward, ...after, coupons: couponsFor(user, now), unlockedColors: user.unlockedColors, unlockedThemes: themesFor(user) });
     } catch (e) {
         console.error("Wheel spin failed:", e);
         res.status(500).json({ error: "Server Error" });

@@ -13,6 +13,7 @@ const Newsletter = require('../models/newsletter');
 const { syncAchievements } = require('../lib/achievements');
 const { sendMail, issueEmailVerification, issueSecurityReportToken, sendVerificationEmail } = require('../lib/email');
 const { couponsFor } = require('../lib/wheel');
+const { themesFor } = require('../lib/themes');
 
 const router = require('express').Router();
 
@@ -204,7 +205,7 @@ router.get('/api/me', authUser, requireVerified, async (req, res) => {
         // routes do.
         const profile = await syncAchievements(user);
         await user.populate('wishlist');
-        res.json({ username: user.username, wishlist: user.wishlist, ...profile, coupons: couponsFor(user), unlockedColors: user.unlockedColors || [] });
+        res.json({ username: user.username, wishlist: user.wishlist, ...profile, coupons: couponsFor(user), unlockedColors: user.unlockedColors || [], unlockedThemes: themesFor(user) });
     } catch (e) { console.error("/api/me failed:", e); res.status(500).json({ error: "Server Error" }); }
 });
 

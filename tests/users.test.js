@@ -216,26 +216,26 @@ describe('profile, ranks and achievements', () => {
         assert.equal(again.body.xp, after.xp);
     });
 
-    it('the Konami badge pays its hidden colour, once, and /me keeps it', async () => {
+    it('the Konami badge pays the hidden Phantom theme, once, and /me keeps it', async () => {
         const before = (await api.get('/me', { token: me.token })).body;
-        assert.ok(!before.unlockedColors.includes('cheatCode'), 'not before it is found');
+        assert.ok(!before.unlockedThemes.includes('phantom'), 'not before it is found');
         const r = await api.post('/achievements', { id: 'cheat_code' }, { token: me.token });
         assert.equal(r.status, 200);
-        assert.ok(r.body.unlockedColors.includes('cheatCode'), 'in the same reply');
+        assert.ok(r.body.unlockedThemes.includes('phantom'), 'in the same reply');
         assert.equal(r.body.xp - before.xp, 10);
         await api.post('/achievements', { id: 'cheat_code' }, { token: me.token });
-        const after = (await api.get('/me', { token: me.token })).body;
-        assert.equal(after.unlockedColors.filter(c => c === 'cheatCode').length, 1);
-        // The colour cannot be reported on its own
-        assert.equal((await api.post('/achievements', { id: 'cheatCode' }, { token: me.token })).status, 400);
+        const stored = await api.col('users').findOne({ username: me.username });
+        assert.deepEqual(stored.unlockedThemes.filter(t => t === 'phantom'), ['phantom'], 'stored once');
+        // The theme cannot be reported on its own
+        assert.equal((await api.post('/achievements', { id: 'phantom' }, { token: me.token })).status, 400);
     });
 
-    it('reaching a rank pays its colour once, and /me shows it', async () => {
+    it('reaching Field Agent pays a bonus spin now, not a colour; Arctic waits for Elite Agent', async () => {
         const r = await api.get('/me', { token: me.token });
         assert.equal(r.body.rank, 'fieldAgent');
-        assert.ok(r.body.unlockedColors.includes('ultraviolet'));
-        const again = await api.get('/me', { token: me.token });
-        assert.equal(again.body.unlockedColors.filter(c => c === 'ultraviolet').length, 1);
+        assert.ok(!r.body.unlockedThemes.includes('arctic'));
+        assert.deepEqual(r.body.ranks.find(x => x.id === 'fieldAgent').rewards, { spins: 1 });
+        assert.deepEqual(r.body.ranks.find(x => x.id === 'eliteAgent').rewards, { theme: 'arctic', spins: 1 });
     });
 });
 
@@ -260,7 +260,7 @@ describe('daily wheel and coupons', () => {
             const r = await api.post('/wheel/spin', undefined, { token: spinner.token });
             assert.equal(r.status, 200);
             assert.ok(r.body.index >= 0 && r.body.index < 8);
-            assert.ok(['blank', 'color', 'coupon'].includes(r.body.reward.type));
+            assert.ok(['blank', 'theme', 'coupon'].includes(r.body.reward.type));
             last = r.body;
             if (last.attemptsLeft === 0) break;      // a win ends the day's cycle at once
         }
