@@ -11,12 +11,12 @@ const { themesFor, grantTheme, THEME_OF_COLOR } = require('../src/lib/themes');
 const { WHEEL_SLICES } = require('../src/lib/wheel');
 const { grantRankRewards } = require('../src/lib/achievements');
 
-const ALL = ['phoenix', 'nebula', 'inferno', 'arctic', 'phantom'];
+const ALL = ['graphite', 'phoenix', 'nebula', 'inferno', 'arctic', 'phantom'];
 const OLD_COLORS = ['cyberGold', 'toxicOrange', 'neonPink', 'matrixGreen', 'ultraviolet', 'arctic', 'phantom', 'cheatCode'];
 
 describe('themes: who can wear what', () => {
     it('a new account has the two free themes and nothing else', () => {
-        assert.deepEqual(themesFor({}), ['phoenix', 'nebula']);
+        assert.deepEqual(themesFor({}), ['graphite', 'phoenix', 'nebula']);
     });
 
     it('every colour that could be won before opens a theme (nobody loses a win)', () => {
@@ -25,13 +25,13 @@ describe('themes: who can wear what', () => {
     });
 
     it('the old rank colour "phantom" opens Arctic, not the Konami theme of the same name', () => {
-        assert.deepEqual(themesFor({ unlockedColors: ['phantom'] }), ['phoenix', 'nebula', 'arctic']);
-        assert.deepEqual(themesFor({ unlockedColors: ['cheatCode'] }), ['phoenix', 'nebula', 'phantom']);
-        assert.deepEqual(themesFor({ unlockedColors: ['neonPink'] }), ['phoenix', 'nebula', 'inferno']);
+        assert.deepEqual(themesFor({ unlockedColors: ['phantom'] }), ['graphite', 'phoenix', 'nebula', 'arctic']);
+        assert.deepEqual(themesFor({ unlockedColors: ['cheatCode'] }), ['graphite', 'phoenix', 'nebula', 'phantom']);
+        assert.deepEqual(themesFor({ unlockedColors: ['neonPink'] }), ['graphite', 'phoenix', 'nebula', 'inferno']);
     });
 
     it('unknown names in either list are ignored, and the order is always the same', () => {
-        assert.deepEqual(themesFor({ unlockedThemes: ['phantom', 'made-up', 'inferno'], unlockedColors: ['nope'] }), ['phoenix', 'nebula', 'inferno', 'phantom']);
+        assert.deepEqual(themesFor({ unlockedThemes: ['phantom', 'made-up', 'inferno'], unlockedColors: ['nope'] }), ['graphite', 'phoenix', 'nebula', 'inferno', 'phantom']);
     });
 
     it('granting a theme the account already has (from an old colour) stores nothing and says so', () => {
@@ -82,13 +82,13 @@ describe('themes: through the API', () => {
     it('/me and /wheel list the themes; an account with old colours sees their themes and keeps the colours', async () => {
         const me = await api.signUp('OldTimer');
         const fresh = (await api.get('/me', { token: me.token })).body;
-        assert.deepEqual(fresh.unlockedThemes, ['phoenix', 'nebula']);
+        assert.deepEqual(fresh.unlockedThemes, ['graphite', 'phoenix', 'nebula']);
 
         await api.col('users').updateOne({ username: 'OldTimer' }, { $set: { unlockedColors: ['matrixGreen', 'phantom'] } });
         const r = await api.get('/me', { token: me.token });
-        assert.deepEqual(r.body.unlockedThemes, ['phoenix', 'nebula', 'inferno', 'arctic']);
+        assert.deepEqual(r.body.unlockedThemes, ['graphite', 'phoenix', 'nebula', 'inferno', 'arctic']);
         assert.deepEqual(r.body.unlockedColors, ['matrixGreen', 'phantom'], 'still sent, for a frontend from before the themes');
-        assert.deepEqual((await api.get('/wheel', { token: me.token })).body.unlockedThemes, ['phoenix', 'nebula', 'inferno', 'arctic']);
+        assert.deepEqual((await api.get('/wheel', { token: me.token })).body.unlockedThemes, ['graphite', 'phoenix', 'nebula', 'inferno', 'arctic']);
 
         const stored = await api.col('users').findOne({ username: 'OldTimer' });
         assert.deepEqual(stored.unlockedColors, ['matrixGreen', 'phantom'], 'the stored colours are not rewritten');

@@ -1,13 +1,13 @@
 // --- 🎨 THEMES ---
-// Five full looks for the site replace the thirteen accent colours of before (Nov 2026). Two are free,
-// one comes from the wheel, one from a rank, one is the Konami secret.
+// Six full looks for the site replace the thirteen accent colours of before (Nov 2026). Three are free
+// (Graphite, the clean matte one, is the default), one comes from the wheel, one from a rank, one is the Konami secret.
 //
 // Nothing stored is rewritten: accounts keep their old `unlockedColors` exactly as they are, and the
 // themes they open are worked out from them on every read (themesFor). So nobody loses what they won,
 // and a rollback of this file loses nothing either. New wins are stored in `unlockedThemes`.
 
-const THEMES = ['phoenix', 'nebula', 'inferno', 'arctic', 'phantom'];
-const FREE_THEMES = ['phoenix', 'nebula'];
+const THEMES = ['graphite', 'phoenix', 'nebula', 'inferno', 'arctic', 'phantom'];
+const FREE_THEMES = ['graphite', 'phoenix', 'nebula'];
 
 // Every colour an account could have won before, and the theme it now opens. Note that the old rank
 // colour called 'phantom' opens Arctic (the rank theme); the Phantom theme is the Konami one, which was
